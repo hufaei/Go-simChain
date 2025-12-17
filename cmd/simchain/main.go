@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -13,8 +14,9 @@ import (
 
 	"simchain-go/internal/blockchain"
 	"simchain-go/internal/mempool"
-	"simchain-go/internal/network"
 	"simchain-go/internal/node"
+	"simchain-go/internal/store"
+	"simchain-go/internal/transport/inproc"
 	"simchain-go/internal/types"
 )
 
@@ -44,12 +46,12 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	genesis := types.NewGenesisBlock()
-	bus := network.NewNetworkBus(*seedFlag)
+	tr := inproc.New(*seedFlag)
 	if *netDelayFlag > 0 {
-		bus.SetDelay(*netDelayFlag)
+		tr.SetDelay(*netDelayFlag)
 	}
 	if *dropRateFlag > 0 {
-		bus.SetDropRate(*dropRateFlag)
+		tr.SetDropRate(*dropRateFlag)
 	}
 
 	diff := uint32(*difficultyFlag)
@@ -158,21 +160,44 @@ func main() {
 	}
 
 	newNode := func(i int) *node.Node {
-		chain, err := blockchain.NewBlockchain(genesis, diff)
+		nodeID := fmt.Sprintf("node-%d", i+1)
+		dataDir := filepath.Join("data", nodeID)
+		st, err := store.Open(dataDir, diff, genesis)
+		if err != nil {
+			log.Fatalf("init store: %v", err)
+		}
+		blocks, err := st.LoadMainChain()
+		if err != nil {
+			log.Fatalf("load chain: %v", err)
+		}
+		if len(blocks) == 0 {
+			log.Fatalf("load chain: empty")
+		}
+
+		chain, err := blockchain.NewBlockchain(blocks[0], diff)
 		if err != nil {
 			log.Fatalf("init chain: %v", err)
 		}
+		for _, b := range blocks[1:] {
+			if _, err := chain.AddBlock(b); err != nil {
+				log.Fatalf("restore chain: %v", err)
+			}
+		}
+
 		mp := mempool.NewMempool()
 		return node.NewNode(
-			fmt.Sprintf("node-%d", i+1),
+			nodeID,
 			chain,
 			mp,
-			bus,
+			tr,
 			node.Config{
 				Difficulty:    diff,
 				MaxTxPerBlock: *maxTxPerBlockFlag,
 				MinerSleep:    *minerSleepFlag,
 				OnTipChange: func(ev node.TipChangeEvent) {
+					if err := st.ApplyTipChange(chain, ev.TipHash, ev.Reorg); err != nil {
+						log.Printf("STORE_ERR node=%s err=%v", nodeID, err)
+					}
 					if *debugDumpOnTipFlag {
 						dumpAll(ev)
 					}

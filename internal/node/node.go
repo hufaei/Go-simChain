@@ -3,7 +3,6 @@ package node
 import (
 	"fmt"
 	"log"
-	"math/big"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,7 +10,8 @@ import (
 	"simchain-go/internal/blockchain"
 	"simchain-go/internal/crypto"
 	"simchain-go/internal/mempool"
-	"simchain-go/internal/network"
+	"simchain-go/internal/syncer"
+	"simchain-go/internal/transport"
 	"simchain-go/internal/types"
 )
 
@@ -60,7 +60,7 @@ type Node struct {
 	id           string
 	chain        *blockchain.Blockchain
 	mempool      *mempool.Mempool
-	bus          *network.NetworkBus
+	tr           transport.Transport
 	difficulty   uint32
 	maxTxPerBlk  int
 	minerSleep   time.Duration
@@ -68,6 +68,7 @@ type Node struct {
 	maxHeaders   int
 	blocksBatch  int
 	onTipChange  func(ev TipChangeEvent)
+	syncer       *syncer.Syncer
 	stopCh       chan struct{}
 	doneCh       chan struct{}
 	stopOnce     sync.Once
@@ -85,7 +86,7 @@ type Node struct {
 	rpcSeq     uint64
 }
 
-func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, bus *network.NetworkBus, cfg Config) *Node {
+func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, tr transport.Transport, cfg Config) *Node {
 	if mp == nil {
 		mp = mempool.NewMempool()
 	}
@@ -93,7 +94,7 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, bus *
 		id:            id,
 		chain:         chain,
 		mempool:       mp,
-		bus:           bus,
+		tr:            tr,
 		difficulty:    cfg.Difficulty,
 		maxTxPerBlk:   cfg.MaxTxPerBlock,
 		minerSleep:    cfg.MinerSleep,
@@ -121,9 +122,23 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, bus *
 	if n.blocksBatch <= 0 {
 		n.blocksBatch = 64
 	}
-	if n.bus != nil {
-		n.bus.Register(n.id, n.HandleMessage)
+	if n.tr != nil {
+		n.tr.Register(n.id, n.HandleMessage)
 	}
+
+	// V3-A：把“追链同步”抽成独立 Syncer。当前先迁移 initial sync，
+	// 后续再把 inv/get 的收发策略也逐步迁出 Node。
+	n.syncer = syncer.New(syncer.Config{
+		NodeID:          n.id,
+		Transport:       n.tr,
+		Chain:           n.chain,
+		SyncTimeout:     n.syncTimeout,
+		MaxHeaders:      n.maxHeaders,
+		BlocksBatchSize: n.blocksBatch,
+		RPC:             n.rpc,
+		OnBlock:         n.onNewBlock,
+	})
+
 	return n
 }
 
@@ -160,7 +175,7 @@ func (n *Node) SubmitTransaction(payload string) {
 	}
 	n.rememberTx(tx)
 	log.Printf("TX_ACCEPTED node=%s tx=%s", n.id, tx.ID)
-	if n.bus == nil {
+	if n.tr == nil {
 		return
 	}
 	msg := types.Message{
@@ -169,7 +184,8 @@ func (n *Node) SubmitTransaction(payload string) {
 		Timestamp: time.Now().UnixMilli(),
 		Payload:   types.InvTxPayload{TxID: tx.ID},
 	}
-	n.bus.Broadcast(n.id, msg)
+	// V2/V3：只广播 txid（InvTx），完整交易通过 GetTx/Tx 按需拉取。
+	n.tr.Broadcast(n.id, msg)
 }
 
 func (n *Node) HandleMessage(msg types.Message) {
@@ -258,9 +274,9 @@ func (n *Node) onNewBlock(b *types.Block, from string) {
 	}
 
 	// Announce new tip blocks as inventory (not full data).
-	if res.IsNewTip && n.bus != nil {
+	if res.IsNewTip && n.tr != nil {
 		meta := types.BlockMeta{Header: b.Header, Nonce: b.Nonce, Hash: h}
-		n.bus.Broadcast(n.id, types.Message{
+		n.tr.Broadcast(n.id, types.Message{
 			Type:      types.MsgInvBlock,
 			From:      n.id,
 			Timestamp: time.Now().UnixMilli(),
@@ -379,9 +395,9 @@ func (n *Node) minerLoop() {
 		}
 
 		// Announce newly mined tip blocks (after counting attempts and handling stop paths).
-		if minedBlock != nil && minedRes.IsNewTip && n.bus != nil {
+		if minedBlock != nil && minedRes.IsNewTip && n.tr != nil {
 			meta := types.BlockMeta{Header: minedBlock.Header, Nonce: minedBlock.Nonce, Hash: minedBlock.Hash}
-			n.bus.Broadcast(n.id, types.Message{
+			n.tr.Broadcast(n.id, types.Message{
 				Type:      types.MsgInvBlock,
 				From:      n.id,
 				Timestamp: time.Now().UnixMilli(),
@@ -520,7 +536,7 @@ func (n *Node) clearInflightBlock(h types.Hash) {
 }
 
 func (n *Node) onInvTx(txid string, from string) {
-	if txid == "" || from == "" || n.bus == nil {
+	if txid == "" || from == "" || n.tr == nil {
 		return
 	}
 	if n.hasTx(txid) {
@@ -532,7 +548,7 @@ func (n *Node) onInvTx(txid string, from string) {
 	time.AfterFunc(n.syncTimeout, func() {
 		n.clearInflightTx(txid)
 	})
-	n.bus.Send(from, types.Message{
+	n.tr.Send(from, types.Message{
 		Type:      types.MsgGetTx,
 		From:      n.id,
 		To:        from,
@@ -542,7 +558,7 @@ func (n *Node) onInvTx(txid string, from string) {
 }
 
 func (n *Node) onGetTx(txid string, requester string) {
-	if txid == "" || requester == "" || n.bus == nil {
+	if txid == "" || requester == "" || n.tr == nil {
 		return
 	}
 	n.mu.Lock()
@@ -551,7 +567,7 @@ func (n *Node) onGetTx(txid string, requester string) {
 	if !ok {
 		return
 	}
-	n.bus.Send(requester, types.Message{
+	n.tr.Send(requester, types.Message{
 		Type:      types.MsgTx,
 		From:      n.id,
 		To:        requester,
@@ -573,10 +589,10 @@ func (n *Node) onTx(tx types.Transaction, from string) {
 	}
 	n.rememberTx(tx)
 	log.Printf("TX_ACCEPTED node=%s tx=%s (from=%s)", n.id, tx.ID, from)
-	if n.bus == nil {
+	if n.tr == nil {
 		return
 	}
-	n.bus.Broadcast(n.id, types.Message{
+	n.tr.Broadcast(n.id, types.Message{
 		Type:      types.MsgInvTx,
 		From:      n.id,
 		Timestamp: time.Now().UnixMilli(),
@@ -585,7 +601,7 @@ func (n *Node) onTx(tx types.Transaction, from string) {
 }
 
 func (n *Node) onInvBlock(meta types.BlockMeta, from string) {
-	if from == "" || n.bus == nil || n.chain == nil {
+	if from == "" || n.tr == nil || n.chain == nil {
 		return
 	}
 	if meta.Hash.IsZero() {
@@ -611,7 +627,7 @@ func (n *Node) onInvBlock(meta types.BlockMeta, from string) {
 }
 
 func (n *Node) requestBlock(to string, h types.Hash) {
-	if to == "" || n.bus == nil || h.IsZero() {
+	if to == "" || n.tr == nil || h.IsZero() {
 		return
 	}
 	if !n.markInflightBlock(h) {
@@ -620,7 +636,7 @@ func (n *Node) requestBlock(to string, h types.Hash) {
 	time.AfterFunc(n.syncTimeout, func() {
 		n.clearInflightBlock(h)
 	})
-	n.bus.Send(to, types.Message{
+	n.tr.Send(to, types.Message{
 		Type:      types.MsgGetBlock,
 		From:      n.id,
 		To:        to,
@@ -630,7 +646,7 @@ func (n *Node) requestBlock(to string, h types.Hash) {
 }
 
 func (n *Node) onGetBlock(h types.Hash, requester string) {
-	if requester == "" || n.bus == nil || n.chain == nil {
+	if requester == "" || n.tr == nil || n.chain == nil {
 		return
 	}
 	b, ok := n.chain.BlockByHash(h)
@@ -641,7 +657,7 @@ func (n *Node) onGetBlock(h types.Hash, requester string) {
 	if b.Txs != nil {
 		cp.Txs = append([]types.Transaction(nil), b.Txs...)
 	}
-	n.bus.Send(requester, types.Message{
+	n.tr.Send(requester, types.Message{
 		Type:      types.MsgBlock,
 		From:      n.id,
 		To:        requester,
@@ -659,10 +675,10 @@ func (n *Node) onBlock(b *types.Block, from string) {
 }
 
 func (n *Node) onGetTip(requester string, traceID string) {
-	if requester == "" || traceID == "" || n.bus == nil || n.chain == nil {
+	if requester == "" || traceID == "" || n.tr == nil || n.chain == nil {
 		return
 	}
-	n.bus.Send(requester, types.Message{
+	n.tr.Send(requester, types.Message{
 		Type:      types.MsgTip,
 		From:      n.id,
 		To:        requester,
@@ -677,7 +693,7 @@ func (n *Node) onGetTip(requester string, traceID string) {
 }
 
 func (n *Node) onGetHeaders(req types.GetHeadersPayload, requester string, traceID string) {
-	if requester == "" || traceID == "" || n.bus == nil || n.chain == nil {
+	if requester == "" || traceID == "" || n.tr == nil || n.chain == nil {
 		return
 	}
 	m := req.Max
@@ -685,7 +701,7 @@ func (n *Node) onGetHeaders(req types.GetHeadersPayload, requester string, trace
 		m = n.maxHeaders
 	}
 	metas := n.chain.MainChainMetasFromLocator(req.Locator, m)
-	n.bus.Send(requester, types.Message{
+	n.tr.Send(requester, types.Message{
 		Type:      types.MsgHeaders,
 		From:      n.id,
 		To:        requester,
@@ -696,7 +712,7 @@ func (n *Node) onGetHeaders(req types.GetHeadersPayload, requester string, trace
 }
 
 func (n *Node) onGetBlocks(req types.GetBlocksPayload, requester string, traceID string) {
-	if requester == "" || traceID == "" || n.bus == nil || n.chain == nil {
+	if requester == "" || traceID == "" || n.tr == nil || n.chain == nil {
 		return
 	}
 	blocks := make([]*types.Block, 0, len(req.Hashes))
@@ -711,7 +727,7 @@ func (n *Node) onGetBlocks(req types.GetBlocksPayload, requester string, traceID
 		}
 		blocks = append(blocks, &cp)
 	}
-	n.bus.Send(requester, types.Message{
+	n.tr.Send(requester, types.Message{
 		Type:      types.MsgBlocks,
 		From:      n.id,
 		To:        requester,
@@ -742,7 +758,7 @@ func (n *Node) tryDeliverRPC(msg types.Message) bool {
 }
 
 func (n *Node) rpc(to string, typ types.MessageType, payload any, timeout time.Duration) (types.Message, bool) {
-	if n.bus == nil || to == "" {
+	if n.tr == nil || to == "" {
 		return types.Message{}, false
 	}
 	if timeout <= 0 {
@@ -754,7 +770,7 @@ func (n *Node) rpc(to string, typ types.MessageType, payload any, timeout time.D
 	n.pendingRPC[traceID] = ch
 	n.mu.Unlock()
 
-	n.bus.Send(to, types.Message{
+	n.tr.Send(to, types.Message{
 		Type:      typ,
 		From:      n.id,
 		To:        to,
@@ -777,95 +793,11 @@ func (n *Node) rpc(to string, typ types.MessageType, payload any, timeout time.D
 // InitialSync pulls missing headers/blocks from the best available peer.
 // It is intended for "late join" nodes that start with only genesis.
 func (n *Node) InitialSync() {
-	if n.bus == nil || n.chain == nil {
+	// V3-A：initial sync 由 Syncer 负责，Node 只做编排。
+	if n.syncer == nil {
 		return
 	}
-	peers := n.bus.PeerIDs()
-	candidates := make([]string, 0, len(peers))
-	for _, p := range peers {
-		if p != n.id {
-			candidates = append(candidates, p)
-		}
-	}
-	if len(candidates) == 0 {
-		return
-	}
-
-	type tipInfo struct {
-		peer   string
-		height uint64
-		work   *big.Int
-		hash   types.Hash
-	}
-
-	var best tipInfo
-	best.work = big.NewInt(-1)
-	for _, p := range candidates {
-		resp, ok := n.rpc(p, types.MsgGetTip, types.GetTipPayload{}, n.syncTimeout)
-		if !ok || resp.Type != types.MsgTip {
-			continue
-		}
-		pl, ok := resp.Payload.(types.TipPayload)
-		if !ok {
-			continue
-		}
-		w := new(big.Int)
-		if _, ok := w.SetString(pl.CumWork, 10); !ok {
-			continue
-		}
-		if best.peer == "" || w.Cmp(best.work) > 0 || (w.Cmp(best.work) == 0 && pl.TipHeight > best.height) {
-			best = tipInfo{peer: p, height: pl.TipHeight, work: w, hash: pl.TipHash}
-		}
-	}
-
-	if best.peer == "" {
-		return
-	}
-
-	log.Printf("SYNC_START node=%s peer=%s", n.id, best.peer)
-	for {
-		localWork := n.chain.TipCumWork()
-		if localWork.Cmp(best.work) >= 0 && n.chain.TipHeight() >= best.height {
-			break
-		}
-
-		locator := n.chain.Locator(32)
-		resp, ok := n.rpc(best.peer, types.MsgGetHeaders, types.GetHeadersPayload{Locator: locator, Max: n.maxHeaders}, n.syncTimeout)
-		if !ok || resp.Type != types.MsgHeaders {
-			break
-		}
-		hpl, ok := resp.Payload.(types.HeadersPayload)
-		if !ok || len(hpl.Metas) == 0 {
-			break
-		}
-
-		hashes := make([]types.Hash, 0, len(hpl.Metas))
-		for _, m := range hpl.Metas {
-			if m.Hash.IsZero() || n.chain.HasBlock(m.Hash) {
-				continue
-			}
-			hashes = append(hashes, m.Hash)
-		}
-
-		for i := 0; i < len(hashes); i += n.blocksBatch {
-			end := i + n.blocksBatch
-			if end > len(hashes) {
-				end = len(hashes)
-			}
-			bresp, ok := n.rpc(best.peer, types.MsgGetBlocks, types.GetBlocksPayload{Hashes: hashes[i:end]}, n.syncTimeout)
-			if !ok || bresp.Type != types.MsgBlocks {
-				continue
-			}
-			bpl, ok := bresp.Payload.(types.BlocksPayload)
-			if !ok {
-				continue
-			}
-			for _, b := range bpl.Blocks {
-				if b != nil {
-					n.onNewBlock(b, best.peer)
-				}
-			}
-		}
-	}
+	log.Printf("SYNC_START node=%s", n.id)
+	n.syncer.InitialSync()
 	log.Printf("SYNC_DONE node=%s height=%d tip=%s", n.id, n.chain.TipHeight(), n.chain.TipHash().String())
 }

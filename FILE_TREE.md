@@ -1,111 +1,76 @@
-# simchain-go 文件结构与职责（V1 + V2）
+# simchain-go 文件结构与职责（V1 + V2 + V3-A）
 
-本文按 `DESIGN.md`（V1：广播整块/整交易）与 `DESIGN_V2.md`（V2：inv 公告 + 按需拉取 + late join 同步）来解读当前仓库：每个目录/文件在系统中承担什么职责，以及它们如何拼出“交易产生 → 传播 → 打包挖矿 → 出块传播 → 分叉/重组 → 收敛”的全流程。
+本文按 `DESIGN.md`（V1）、`DESIGN_V2.md`（V2：inv 公告 + 按需拉取）、`DESIGN_V3.md`（V3-A：Transport/Syncer/Store 拆分 + 主链持久化）来解读当前仓库：每个目录/文件在系统中承担什么职责，以及它们如何拼出“交易产生 → 传播 → 挖矿出块 → 分叉/重组 → 收敛 → 主链落盘”的全流程。
 
 ---
 
 ## 目录树（到文件粒度的分工说明）
 
-> 约定：`cmd/` 是可执行入口；`internal/` 是内部实现（不对外暴露 API）；`.idea/` 是 IDE 配置，可忽略。
-
 - `README.md`
-  - 项目简介 + 如何运行模拟/测试的最短路径命令。
+  - 项目简介 + 常用运行/测试命令。
 - `DESIGN.md`
-  - V1 说明书：总体目标、数据模型、PoW、节点/链/网络分工、日志与测试建议。
+  - V1 说明书：数据模型、PoW、Node/Chain/Network 分工、日志与测试策略。
 - `DESIGN_V2.md`
-  - V2 演进设计：对齐“比特币风格”的 `inv + getdata`（先公告、再按需拉取），以及“节点中途加入”的 headers-first 同步流程。
+  - V2 说明书：`Inv*` 公告 + `Get*/*` 按需拉取（避免广播整块/整交易）、headers-first、late join。
+- `DESIGN_V3.md`
+  - V3-A 设计：引入 `Transport/Syncer/Store` 的架构拆分与主链持久化（默认目录 `data/<nodeID>/...`）。
 - `go.mod`
-  - Go module 定义：模块名 `simchain-go`，声明 Go 版本（目前为 `go 1.25`）。
+  - Go module 定义：模块名 `simchain-go`。
 
 - `cmd/`
   - `cmd/simchain/main.go`
-    - **模拟器 Runner（主程序入口）**：解析参数、创建 genesis、初始化 `NetworkBus`、创建 N 个节点并启动挖矿。
-    - **交易注入器（Tx Injector）**：按 `--tx-interval` 周期生成 payload 并投递到某个节点。
-      - V2 下节点只广播 `InvTx(txid)`，其他节点会 `GetTx` 拉取完整交易。
-    - **Late join 演示**：支持 `--bootstrap-nodes` + `--join-delay` 在模拟运行中途加入新节点；新节点先 `InitialSync()` 拉齐到网络 tip，再开始挖矿。
-    - **调试导出（按 tip 变化触发，默认开启）**：每当任一节点主链 tip 变化，会打印所有节点的：
-      - mempool（大小 + 前 N 个 txid，`--debug-mempool-max`）
-      - 最近 N 个主链区块（`--debug-chain-depth`），以及每块前 N 个 txid（`--debug-block-tx-max`）
-      - 可用 `--debug-dump-on-tip=false` 关闭
-    - **网络故障注入**：`--net-delay`/`--drop-rate` 用于模拟延迟/丢包。
-    - **收尾与统计**：运行 `--duration` 后停止挖矿，打印每个节点 mined/received/height。
+    - **Runner**：解析参数、初始化 `Transport(inproc)`、创建/启动节点、注入交易、停止并输出汇总。
+    - **持久化目录（V3-A）**：每个节点默认写到 `data/<nodeID>/manifest.json` + `data/<nodeID>/blocks/<height>.json`。
+    - **调试输出（块状 pretty）**：tip 变化触发 `STATE_DUMP`（可通过 `--debug-dump-on-tip=false` 关闭）。
+    - **结束汇总**：`SIMULATION_SUMMARY`（含每节点 hash 尝试次数与占比）。
 
 - `internal/`
-  - `internal/types/`（协议/数据结构：Block、Tx、Message）
-    - `internal/types/transaction.go`
-      - **极简交易模型**：`Transaction{ID, Timestamp, Payload}`（无签名/余额/UTXO 校验，只用于演示传播与进块）。
-      - `NewTransaction(payload)`：生成交易 ID（随机字节 + 时间戳）。
-    - `internal/types/block.go`
-      - **Hash 与区块结构**：
-        - `type Hash [32]byte`：统一哈希类型（hex 输出 + JSON 编解码）。
-        - `BlockHeader{Height, PrevHash, Timestamp, Difficulty, MinerID, TxRoot}`
-        - `Block{Header, Nonce, Hash, Txs}`
-      - `BlockMeta{Header, Nonce, Hash}`：V2 用于 `InvBlock` 公告与 headers-first 同步（足以轻校验 PoW，但不含交易列表）。
-      - `NewGenesisBlock()`：创建确定性 genesis（实际 genesis hash 在 `blockchain.NewBlockchain` 内计算并落库）。
+  - `internal/types/`（协议/数据结构）
+    - `internal/types/transaction.go`：极简交易 `Transaction{ID, Timestamp, Payload}`。
+    - `internal/types/block.go`：`Hash/BlockHeader/Block`，以及 V2/V3 公告用的 `BlockMeta`。
     - `internal/types/message.go`
-      - **节点间消息类型**（内存网络“协议层”）：
-        - V1（保留但非主路径）：`NewTx/NewBlock/RequestTip/ResponseTip`
-        - V2（主路径）：
-          - 交易：`InvTx/GetTx/Tx`
-          - 区块：`InvBlock/GetBlock/Block`
-          - 加入同步：`GetTip/Tip/GetHeaders/Headers/GetBlocks/Blocks`
-      - `Message{Type, From, To, Timestamp, TraceID, Payload any}`：V2 的 `TraceID` 用于一次请求-一次响应的 RPC 式同步。
+      - V2 主要消息：`InvTx/GetTx/Tx`、`InvBlock/GetBlock/Block`
+      - 同步消息：`GetTip/Tip/GetHeaders/Headers/GetBlocks/Blocks`
+      - `TraceID`：用于一次请求-一次响应的轻量 RPC 匹配（initial sync 用）。
 
-  - `internal/crypto/`（哈希与 PoW 难度相关）
-    - `internal/crypto/pow.go`
-      - `HashHeaderNonce(h, nonce)`：`SHA256(Serialize(header) || nonceLE)`（PoW/区块哈希）。
-      - `HashTransactions(txs)`：简化版 TxRoot（拼 txid 后哈希，非 Merkle Tree）。
-      - `LeadingZeroBits/MeetsDifficulty`：前导零 bit 难度判断。
-      - `WorkForDifficulty`：近似 `2^difficulty`，用于累积工作量主链选择。
-    - `internal/crypto/pow_test.go`
-      - 覆盖前导零与难度判断的边界/正确性。
+  - `internal/crypto/`（PoW 与哈希）
+    - `internal/crypto/pow.go`：`HashHeaderNonce`、`LeadingZeroBits/MeetsDifficulty`、`HashTransactions`、`WorkForDifficulty`。
+    - `internal/crypto/pow_test.go`：PoW 难度判断测试。
 
-  - `internal/blockchain/`（区块索引、累积工作量、分叉与重组）
-    - `internal/blockchain/chain.go`
-      - **链索引**：`blocks/parent/height/cumWork/tip/orphans`，支持乱序接入、孤块暂存、累积工作量选 tip。
-      - **完整校验**：difficulty/height/prevHash/timestamp/TxRoot/hash/PoW。
-      - **重组信息**：`Reorg{CommonAncestor, Removed, Added}`（给节点用于修正 mempool）。
-      - **V2 同步辅助**：
-        - `Locator(max)`：生成 block locator（tip 往回指数抽样）。
-        - `MainChainMetasFromLocator(locator, max)`：从共同祖先之后返回主链上的 `BlockMeta`（用于 headers-first）。
-    - `internal/blockchain/chain_test.go`
-      - 分叉/重组选链测试（V1 就有）。
-      - V2：增加 locator → metas 的 headers-first 行为测试。
-
-  - `internal/mempool/`（交易池：去重 + FIFO）
+  - `internal/mempool/`（未确认交易池）
     - `internal/mempool/mempool.go`
-      - `Add/Pop/Return/RemoveByID/Size`：
-        - `Pop` 给矿工组块；
-        - `Return` 用于 reorg 时退回旧主链交易；
-        - `RemoveByID` 用于新主链确认后剔除交易，避免重复打包。
+      - `Add/Pop/Return/RemoveByID/Size`
+      - `Snapshot(max)`：调试输出用（查看 mempool 前 N 笔交易）。
 
-  - `internal/network/`（内存网络：广播 + 定向发送 + 故障注入）
+  - `internal/blockchain/`（链索引 + 主链选择 + reorg）
+    - `internal/blockchain/chain.go`
+      - 区块校验与接入、orphan 连接、cumWork 选 tip、reorg 差异集（CommonAncestor/Removed/Added）
+      - V2/V3 同步辅助：`Locator()`、`MainChainMetasFromLocator()`、`MainChainBlocks()`（调试/落盘用）
+    - `internal/blockchain/chain_test.go`：分叉/重组与 locator 行为测试。
+
+  - `internal/network/`（V2 仍在用的“内存网络内核”）
     - `internal/network/bus.go`
-      - `Register/Unregister`：节点订阅上线/下线。
-      - `PeerIDs()`：当前已注册的节点列表（V2 late join 同步选 peer 用）。
-      - `Broadcast(from, msg)`：扇出广播（V2 主要用于 `InvTx/InvBlock` 公告）。
-      - `Send(to, msg)`：定向投递（V2 的 `Get*/*` 请求-响应走这里）。
-      - `SetDelay/SetDropRate`：模拟延迟/丢包。
+      - `Broadcast`（扇出）+ `Send`（定向）+ 延迟/丢包注入
+      - V3-A 中它被 `internal/transport/inproc` 适配为 `Transport` 接口
 
-  - `internal/node/`（节点：挖矿循环 + inv/get + 加入同步）
+  - `internal/transport/`（V3-A：传输抽象）
+    - `internal/transport/transport.go`：Transport 接口（Broadcast/Send/Peers/Register...）
+    - `internal/transport/inproc/inproc.go`：inproc 实现（适配 `NetworkBus`）
+
+  - `internal/syncer/`（V3-A：同步器）
+    - `internal/syncer/syncer.go`
+      - 当前先承载 “late join 的 InitialSync” 逻辑（从 Node 迁出）
+      - 后续 V3-A 会把更完整的长期同步状态机（retry/window/backoff）逐步搬进来
+
+  - `internal/store/`（V3-A：主链持久化）
+    - `internal/store/store.go`
+      - 只持久化主链（blocks 按高度存文件 + manifest）
+      - `ApplyTipChange`：tip 增长 append；reorg 回滚到共同祖先后再写入新主链段
+
+  - `internal/node/`（节点：挖矿 + 协议处理 + 编排）
     - `internal/node/node.go`
-      - **挖矿**：`minerLoop` 从 mempool 取交易 → 试 nonce → 出块后本地 `AddBlock` → 广播 `InvBlock(meta)`（不广播整块）。
-      - **交易传播（V2）**：
-        - 本地提交：入池 + 记录 tx → 广播 `InvTx(txid)`
-        - 收到 `InvTx`：未知则 `GetTx` 拉取；收到 `Tx` 后入池并再 `InvTx` 扩散
-      - **区块传播（V2）**：
-        - 收到 `InvBlock(meta)`：先轻校验 PoW，再 `GetBlock(hash)` 拉整块；收到 `Block` 后 `AddBlock`
-      - **重组后 mempool 修正**：`applyReorg/removeTxsFromBlock`
-      - **节点加入同步（V2）**：`InitialSync()`（GetTip → GetHeaders → GetBlocks 批量拉齐）
+      - 挖矿：mempool 取交易 → PoW → `chain.AddBlock` → 广播 `InvBlock(meta)`
+      - 协议：处理 `InvTx/GetTx/Tx`、`InvBlock/GetBlock/Block`、同步请求 `GetTip/GetHeaders/GetBlocks`
+      - V3-A：`InitialSync()` 现在委托给 `internal/syncer`（Node 更像 orchestrator）
+      - 可观测：`DebugState()` 给 Runner 的 `STATE_DUMP` 使用
 
----
-
-## “设计文档 → 代码落点”速查
-
-- **PoW / 难度 / 哈希**：`internal/crypto/pow.go`
-- **区块/交易/消息模型**：`internal/types/*.go`
-- **主链选择 + 分叉重组**：`internal/blockchain/chain.go`
-- **mempool（未确认交易池）**：`internal/mempool/mempool.go`
-- **网络（广播 inv + 定向拉取）**：`internal/network/bus.go`
-- **节点（inv/get + 挖矿 + initial sync）**：`internal/node/node.go`
-- **端到端入口（含 late join flags）**：`cmd/simchain/main.go`
