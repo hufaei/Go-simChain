@@ -80,3 +80,17 @@ func (m *Mempool) Size() int {
 	defer m.mu.Unlock()
 	return len(m.txs)
 }
+
+// Snapshot returns up to max pending transactions in arrival order.
+// It returns copies suitable for debugging/printing.
+func (m *Mempool) Snapshot(max int) []types.Transaction {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.txs) == 0 || max == 0 {
+		return nil
+	}
+	if max < 0 || max > len(m.txs) {
+		max = len(m.txs)
+	}
+	return append([]types.Transaction(nil), m.txs[:max]...)
+}

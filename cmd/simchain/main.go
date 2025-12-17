@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +30,11 @@ func main() {
 	joinDelayFlag := flag.Duration("join-delay", 0, "delay before starting each late-join node")
 	netDelayFlag := flag.Duration("net-delay", 0, "simulated network delay")
 	dropRateFlag := flag.Float64("drop-rate", 0, "simulated network drop rate [0..1]")
+	debugDumpOnTipFlag := flag.Bool("debug-dump-on-tip", true, "dump all nodes' mempool + recent main-chain blocks whenever any node's tip changes (set to false to disable)")
+	debugDumpFormatFlag := flag.String("debug-dump-format", "pretty", "debug dump format: pretty|json")
+	debugChainDepthFlag := flag.Int("debug-chain-depth", 8, "how many recent main-chain blocks to print per node when dumping (0 disables chain dump)")
+	debugMempoolMaxFlag := flag.Int("debug-mempool-max", 20, "how many mempool txids to print per node when dumping (0 disables mempool listing)")
+	debugBlockTxMaxFlag := flag.Int("debug-block-tx-max", 20, "how many txids to print per main-chain block when dumping (0 disables tx listing)")
 	flag.Parse()
 
 	if *nodesFlag < 1 {
@@ -67,6 +75,85 @@ func main() {
 		return append([]*node.Node(nil), nodes...)
 	}
 
+	var dumpMu sync.Mutex
+	shortHash := func(h types.Hash) string {
+		s := h.String()
+		if len(s) <= 12 {
+			return s
+		}
+		return s[:12]
+	}
+
+	logBlock := func(title string, lines []string) {
+		var b strings.Builder
+		b.WriteString(title)
+		for _, line := range lines {
+			b.WriteString("\n")
+			b.WriteString(line)
+		}
+		log.Print(b.String())
+	}
+
+	debugStatePrettyLines := func(st node.DebugState) []string {
+		lines := make([]string, 0, 3+len(st.MainChain))
+		lines = append(lines, fmt.Sprintf("  node=%s tipHeight=%d tip=%s", st.NodeID, st.TipHeight, shortHash(st.TipHash)))
+		if *debugMempoolMaxFlag == 0 {
+			lines = append(lines, fmt.Sprintf("  mempool size=%d", st.MempoolSize))
+		} else {
+			lines = append(lines, fmt.Sprintf("  mempool size=%d txids=[%s]", st.MempoolSize, strings.Join(st.MempoolTxIDs, ", ")))
+		}
+		if *debugChainDepthFlag != 0 {
+			lines = append(lines, "  mainchain:")
+			for _, b := range st.MainChain {
+				txSuffix := ""
+				if *debugBlockTxMaxFlag != 0 && len(b.TxIDs) > 0 {
+					txSuffix = " txids=[" + strings.Join(b.TxIDs, ", ") + "]"
+				}
+				lines = append(lines, fmt.Sprintf("    - h=%d hash=%s txs=%d%s", b.Height, shortHash(b.Hash), b.TxCount, txSuffix))
+			}
+		}
+		return lines
+	}
+
+	dumpAll := func(trigger node.TipChangeEvent) {
+		dumpMu.Lock()
+		defer dumpMu.Unlock()
+
+		nodesSnap := snapshotNodes()
+		if strings.EqualFold(*debugDumpFormatFlag, "json") {
+			type dump struct {
+				Trigger node.TipChangeEvent `json:"trigger"`
+				Nodes   []node.DebugState   `json:"nodes"`
+			}
+			payload := dump{Trigger: trigger, Nodes: make([]node.DebugState, 0, len(nodesSnap))}
+			for _, n := range nodesSnap {
+				payload.Nodes = append(payload.Nodes, n.DebugState(*debugChainDepthFlag, *debugMempoolMaxFlag, *debugBlockTxMaxFlag))
+			}
+			// Stable ordering for diffing.
+			sort.Slice(payload.Nodes, func(i, j int) bool { return payload.Nodes[i].NodeID < payload.Nodes[j].NodeID })
+			raw, err := jsonMarshalIndent(payload)
+			if err != nil {
+				log.Printf("STATE_DUMP_ERR err=%v", err)
+				return
+			}
+			log.Print("STATE_DUMP_JSON\n" + string(raw))
+			return
+		}
+
+		lines := []string{
+			fmt.Sprintf("trigger node=%s from=%s height=%d tip=%s reorg=%t", trigger.NodeID, trigger.FromPeer, trigger.Height, shortHash(trigger.TipHash), trigger.Reorg != nil),
+		}
+		states := make([]node.DebugState, 0, len(nodesSnap))
+		for _, n := range nodesSnap {
+			states = append(states, n.DebugState(*debugChainDepthFlag, *debugMempoolMaxFlag, *debugBlockTxMaxFlag))
+		}
+		sort.Slice(states, func(i, j int) bool { return states[i].NodeID < states[j].NodeID })
+		for _, st := range states {
+			lines = append(lines, debugStatePrettyLines(st)...)
+		}
+		logBlock("STATE_DUMP", lines)
+	}
+
 	newNode := func(i int) *node.Node {
 		chain, err := blockchain.NewBlockchain(genesis, diff)
 		if err != nil {
@@ -82,6 +169,11 @@ func main() {
 				Difficulty:    diff,
 				MaxTxPerBlock: *maxTxPerBlockFlag,
 				MinerSleep:    *minerSleepFlag,
+				OnTipChange: func(ev node.TipChangeEvent) {
+					if *debugDumpOnTipFlag {
+						dumpAll(ev)
+					}
+				},
 			},
 		)
 	}
@@ -147,8 +239,57 @@ loop:
 		n.StopMining()
 	}
 
-	for _, n := range snapshotNodes() {
-		mined, received, height := n.Stats()
-		log.Printf("STATS node=%s mined=%d received=%d height=%d", n.ID(), mined, received, height)
+	nodesSnap := snapshotNodes()
+
+	var totalHashes uint64
+	var totalMined uint64
+	for _, n := range nodesSnap {
+		totalHashes += n.HashAttempts()
+		mined, _, _ := n.Stats()
+		totalMined += mined
 	}
+	type nodeRow struct {
+		ID         string
+		Mined      uint64
+		Received   uint64
+		Height     uint64
+		Hashes     uint64
+		HashShare  float64
+		MinedShare float64
+	}
+	rows := make([]nodeRow, 0, len(nodesSnap))
+	for _, n := range nodesSnap {
+		mined, received, height := n.Stats()
+		hashes := n.HashAttempts()
+		hashShare := 0.0
+		minedShare := 0.0
+		if totalHashes > 0 {
+			hashShare = float64(hashes) / float64(totalHashes)
+		}
+		if totalMined > 0 {
+			minedShare = float64(mined) / float64(totalMined)
+		}
+		rows = append(rows, nodeRow{
+			ID:         n.ID(),
+			Mined:      mined,
+			Received:   received,
+			Height:     height,
+			Hashes:     hashes,
+			HashShare:  hashShare,
+			MinedShare: minedShare,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	lines := []string{
+		fmt.Sprintf("txs=%d totalHashes=%d totalMined=%d", txCount, totalHashes, totalMined),
+	}
+	for _, r := range rows {
+		lines = append(lines, fmt.Sprintf("node=%s height=%d mined=%d(%.2f%%) received=%d hashes=%d(%.2f%%)",
+			r.ID, r.Height, r.Mined, r.MinedShare*100, r.Received, r.Hashes, r.HashShare*100))
+	}
+	logBlock("SIMULATION_SUMMARY", lines)
+}
+
+func jsonMarshalIndent(v any) ([]byte, error) {
+	return json.MarshalIndent(v, "", "  ")
 }

@@ -23,6 +23,10 @@
     - **交易注入器（Tx Injector）**：按 `--tx-interval` 周期生成 payload 并投递到某个节点。
       - V2 下节点只广播 `InvTx(txid)`，其他节点会 `GetTx` 拉取完整交易。
     - **Late join 演示**：支持 `--bootstrap-nodes` + `--join-delay` 在模拟运行中途加入新节点；新节点先 `InitialSync()` 拉齐到网络 tip，再开始挖矿。
+    - **调试导出（按 tip 变化触发，默认开启）**：每当任一节点主链 tip 变化，会打印所有节点的：
+      - mempool（大小 + 前 N 个 txid，`--debug-mempool-max`）
+      - 最近 N 个主链区块（`--debug-chain-depth`），以及每块前 N 个 txid（`--debug-block-tx-max`）
+      - 可用 `--debug-dump-on-tip=false` 关闭
     - **网络故障注入**：`--net-delay`/`--drop-rate` 用于模拟延迟/丢包。
     - **收尾与统计**：运行 `--duration` 后停止挖矿，打印每个节点 mined/received/height。
 
@@ -105,4 +109,3 @@
 - **网络（广播 inv + 定向拉取）**：`internal/network/bus.go`
 - **节点（inv/get + 挖矿 + initial sync）**：`internal/node/node.go`
 - **端到端入口（含 late join flags）**：`cmd/simchain/main.go`
-

@@ -403,3 +403,25 @@ func (bc *Blockchain) mainChainHashesUnlocked() []types.Hash {
 	}
 	return reversed
 }
+
+// MainChainBlocks returns up to limit blocks from the current main chain, oldest->newest.
+// If limit <= 0, it returns the full main chain.
+func (bc *Blockchain) MainChainBlocks(limit int) []*types.Block {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	hashes := bc.mainChainHashesUnlocked()
+	if len(hashes) == 0 {
+		return nil
+	}
+	if limit > 0 && limit < len(hashes) {
+		hashes = hashes[len(hashes)-limit:]
+	}
+	out := make([]*types.Block, 0, len(hashes))
+	for _, h := range hashes {
+		if b := bc.blocks[h]; b != nil {
+			out = append(out, cloneBlock(b))
+		}
+	}
+	return out
+}

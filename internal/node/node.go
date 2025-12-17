@@ -26,24 +26,54 @@ type Config struct {
 	MaxHeaders int
 	// GetBlocksBatchSize controls how many block hashes are requested per GetBlocks call.
 	GetBlocksBatchSize int
+
+	// OnTipChange is called after this node's main-chain tip changes and mempool has been adjusted.
+	// Intended for debugging/observability from the runner.
+	OnTipChange func(ev TipChangeEvent)
+}
+
+type TipChangeEvent struct {
+	NodeID   string
+	FromPeer string
+	Height   uint64
+	TipHash  types.Hash
+	Reorg    *blockchain.Reorg
+}
+
+type DebugBlock struct {
+	Height  uint64
+	Hash    types.Hash
+	TxCount int
+	TxIDs   []string
+}
+
+type DebugState struct {
+	NodeID       string
+	TipHeight    uint64
+	TipHash      types.Hash
+	MempoolSize  int
+	MempoolTxIDs []string
+	MainChain    []DebugBlock // oldest->newest, truncated by requested depth
 }
 
 type Node struct {
-	id          string
-	chain       *blockchain.Blockchain
-	mempool     *mempool.Mempool
-	bus         *network.NetworkBus
-	difficulty  uint32
-	maxTxPerBlk int
-	minerSleep  time.Duration
-	syncTimeout time.Duration
-	maxHeaders  int
-	blocksBatch int
-	stopCh      chan struct{}
-	doneCh      chan struct{}
-	stopOnce    sync.Once
-	minedBlocks uint64
-	recvBlocks  uint64
+	id           string
+	chain        *blockchain.Blockchain
+	mempool      *mempool.Mempool
+	bus          *network.NetworkBus
+	difficulty   uint32
+	maxTxPerBlk  int
+	minerSleep   time.Duration
+	syncTimeout  time.Duration
+	maxHeaders   int
+	blocksBatch  int
+	onTipChange  func(ev TipChangeEvent)
+	stopCh       chan struct{}
+	doneCh       chan struct{}
+	stopOnce     sync.Once
+	minedBlocks  uint64
+	recvBlocks   uint64
+	hashAttempts uint64
 
 	mu            sync.Mutex
 	knownTxIDs    map[string]struct{}
@@ -70,6 +100,7 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, bus *
 		syncTimeout:   cfg.SyncTimeout,
 		maxHeaders:    cfg.MaxHeaders,
 		blocksBatch:   cfg.GetBlocksBatchSize,
+		onTipChange:   cfg.OnTipChange,
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
 		knownTxIDs:    make(map[string]struct{}),
@@ -116,6 +147,10 @@ func (n *Node) Stats() (mined uint64, received uint64, height uint64) {
 		height = n.chain.TipHeight()
 	}
 	return
+}
+
+func (n *Node) HashAttempts() uint64 {
+	return atomic.LoadUint64(&n.hashAttempts)
 }
 
 func (n *Node) SubmitTransaction(payload string) {
@@ -232,6 +267,16 @@ func (n *Node) onNewBlock(b *types.Block, from string) {
 			Payload:   types.InvBlockPayload{Meta: meta},
 		})
 	}
+
+	if res.IsNewTip && n.onTipChange != nil {
+		n.onTipChange(TipChangeEvent{
+			NodeID:   n.id,
+			FromPeer: from,
+			Height:   n.chain.TipHeight(),
+			TipHash:  n.chain.TipHash(),
+			Reorg:    res.Reorg,
+		})
+	}
 }
 
 func (n *Node) minerLoop() {
@@ -259,13 +304,20 @@ func (n *Node) minerLoop() {
 		}
 
 		var nonce uint64
+		var attempts uint64
+		var stopping bool
+		var minedBlock *types.Block
+		var minedRes blockchain.AddResult
 		for {
 			select {
 			case <-n.stopCh:
-				n.mempool.Return(txs)
-				return
+				stopping = true
 			default:
 			}
+			if stopping {
+				break
+			}
+			attempts++
 			h, err := crypto.HashHeaderNonce(header, nonce)
 			if err != nil {
 				nonce++
@@ -298,22 +350,43 @@ func (n *Node) minerLoop() {
 					n.removeTxsFromBlock(block)
 				}
 
+				minedBlock = block
+				minedRes = res
 				atomic.AddUint64(&n.minedBlocks, 1)
 				log.Printf("BLOCK_MINED node=%s h=%d hash=%s nonce=%d txs=%d", n.id, header.Height, block.Hash.String(), nonce, len(txs))
 
-				if n.bus != nil {
-					meta := types.BlockMeta{Header: block.Header, Nonce: block.Nonce, Hash: block.Hash}
-					n.bus.Broadcast(n.id, types.Message{
-						Type:      types.MsgInvBlock,
-						From:      n.id,
-						Timestamp: time.Now().UnixMilli(),
-						Payload:   types.InvBlockPayload{Meta: meta},
+				if res.IsNewTip && n.onTipChange != nil {
+					n.onTipChange(TipChangeEvent{
+						NodeID:   n.id,
+						FromPeer: n.id,
+						Height:   n.chain.TipHeight(),
+						TipHash:  n.chain.TipHash(),
+						Reorg:    res.Reorg,
 					})
 				}
 
 				break
 			}
 			nonce++
+		}
+
+		if attempts > 0 {
+			atomic.AddUint64(&n.hashAttempts, attempts)
+		}
+		if stopping {
+			n.mempool.Return(txs)
+			return
+		}
+
+		// Announce newly mined tip blocks (after counting attempts and handling stop paths).
+		if minedBlock != nil && minedRes.IsNewTip && n.bus != nil {
+			meta := types.BlockMeta{Header: minedBlock.Header, Nonce: minedBlock.Nonce, Hash: minedBlock.Hash}
+			n.bus.Broadcast(n.id, types.Message{
+				Type:      types.MsgInvBlock,
+				From:      n.id,
+				Timestamp: time.Now().UnixMilli(),
+				Payload:   types.InvBlockPayload{Meta: meta},
+			})
 		}
 
 		if n.minerSleep > 0 {
@@ -356,6 +429,48 @@ func (n *Node) removeTxsFromBlock(b *types.Block) {
 		ids[tx.ID] = struct{}{}
 	}
 	n.mempool.RemoveByID(ids)
+}
+
+func (n *Node) DebugState(chainDepth int, mempoolMax int, blockTxMax int) DebugState {
+	out := DebugState{
+		NodeID:      n.id,
+		MempoolSize: n.mempool.Size(),
+	}
+	if n.chain != nil {
+		out.TipHeight = n.chain.TipHeight()
+		out.TipHash = n.chain.TipHash()
+	}
+
+	txs := n.mempool.Snapshot(mempoolMax)
+	out.MempoolTxIDs = make([]string, 0, len(txs))
+	for _, tx := range txs {
+		out.MempoolTxIDs = append(out.MempoolTxIDs, tx.ID)
+	}
+
+	if n.chain != nil && chainDepth != 0 {
+		blocks := n.chain.MainChainBlocks(chainDepth)
+		out.MainChain = make([]DebugBlock, 0, len(blocks))
+		for _, b := range blocks {
+			if b == nil {
+				continue
+			}
+			db := DebugBlock{Height: b.Header.Height, Hash: b.Hash}
+			db.TxCount = len(b.Txs)
+			if len(b.Txs) > 0 && blockTxMax != 0 {
+				max := blockTxMax
+				if max < 0 || max > len(b.Txs) {
+					max = len(b.Txs)
+				}
+				db.TxIDs = make([]string, 0, max)
+				for i := 0; i < max; i++ {
+					db.TxIDs = append(db.TxIDs, b.Txs[i].ID)
+				}
+			}
+			out.MainChain = append(out.MainChain, db)
+		}
+	}
+
+	return out
 }
 
 func (n *Node) rememberTx(tx types.Transaction) {
