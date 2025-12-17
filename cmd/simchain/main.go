@@ -209,6 +209,7 @@ func main() {
 	for i := 0; i < bootstrap; i++ {
 		n := newNode(i)
 		addNode(n)
+		n.StartSync()
 		n.StartMining()
 	}
 
@@ -232,6 +233,7 @@ func main() {
 				n := newNode(i)
 				addNode(n)
 				n.InitialSync()
+				n.StartSync()
 				n.StartMining()
 				log.Printf("NODE_JOINED node=%s", n.ID())
 			}
@@ -265,6 +267,9 @@ loop:
 	close(stopJoin)
 	for _, n := range snapshotNodes() {
 		n.StopMining()
+	}
+	for _, n := range snapshotNodes() {
+		n.StopSync()
 	}
 
 	nodesSnap := snapshotNodes()

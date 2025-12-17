@@ -60,7 +60,11 @@
   - `internal/syncer/`（V3-A：同步器）
     - `internal/syncer/syncer.go`
       - 当前先承载 “late join 的 InitialSync” 逻辑（从 Node 迁出）
-      - 后续 V3-A 会把更完整的长期同步状态机（retry/window/backoff）逐步搬进来
+      - 已增加常驻循环：周期性探测 peers tip，选择 best peer 并在落后时做 headers-first catch-up（为后续完整状态机打底）
+  - `internal/peer/`（V3-A：peer 选择/退避）
+    - `internal/peer/peermanager.go`
+      - 维护每个 peer 的 tip/cumWork/RTT/超时与冷却窗口（backoff）
+      - 提供 `BestPeer()` 给 Syncer 选择同步来源
 
   - `internal/store/`（V3-A：主链持久化）
     - `internal/store/store.go`
@@ -73,4 +77,3 @@
       - 协议：处理 `InvTx/GetTx/Tx`、`InvBlock/GetBlock/Block`、同步请求 `GetTip/GetHeaders/GetBlocks`
       - V3-A：`InitialSync()` 现在委托给 `internal/syncer`（Node 更像 orchestrator）
       - 可观测：`DebugState()` 给 Runner 的 `STATE_DUMP` 使用
-

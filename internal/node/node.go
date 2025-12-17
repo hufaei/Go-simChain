@@ -148,11 +148,25 @@ func (n *Node) StartMining() {
 	go n.minerLoop()
 }
 
+func (n *Node) StartSync() {
+	if n.syncer == nil {
+		return
+	}
+	n.syncer.Start()
+}
+
 func (n *Node) StopMining() {
 	n.stopOnce.Do(func() {
 		close(n.stopCh)
 	})
 	<-n.doneCh
+}
+
+func (n *Node) StopSync() {
+	if n.syncer == nil {
+		return
+	}
+	n.syncer.Stop()
 }
 
 func (n *Node) Stats() (mined uint64, received uint64, height uint64) {
