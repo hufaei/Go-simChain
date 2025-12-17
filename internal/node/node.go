@@ -457,12 +457,12 @@ func (n *Node) DebugState(chainDepth int, mempoolMax int, blockTxMax int) DebugS
 			db := DebugBlock{Height: b.Header.Height, Hash: b.Hash}
 			db.TxCount = len(b.Txs)
 			if len(b.Txs) > 0 && blockTxMax != 0 {
-				max := blockTxMax
-				if max < 0 || max > len(b.Txs) {
-					max = len(b.Txs)
+				txMax := blockTxMax
+				if txMax < 0 || txMax > len(b.Txs) {
+					txMax = len(b.Txs)
 				}
-				db.TxIDs = make([]string, 0, max)
-				for i := 0; i < max; i++ {
+				db.TxIDs = make([]string, 0, txMax)
+				for i := 0; i < txMax; i++ {
 					db.TxIDs = append(db.TxIDs, b.Txs[i].ID)
 				}
 			}
@@ -680,11 +680,11 @@ func (n *Node) onGetHeaders(req types.GetHeadersPayload, requester string, trace
 	if requester == "" || traceID == "" || n.bus == nil || n.chain == nil {
 		return
 	}
-	max := req.Max
-	if max <= 0 || max > n.maxHeaders {
-		max = n.maxHeaders
+	m := req.Max
+	if m <= 0 || m > n.maxHeaders {
+		m = n.maxHeaders
 	}
-	metas := n.chain.MainChainMetasFromLocator(req.Locator, max)
+	metas := n.chain.MainChainMetasFromLocator(req.Locator, m)
 	n.bus.Send(requester, types.Message{
 		Type:      types.MsgHeaders,
 		From:      n.id,

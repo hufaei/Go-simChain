@@ -11,6 +11,10 @@ import (
 type Handler func(msg types.Message)
 
 // NetworkBus is an in-memory pub/sub bus simulating a network.
+//
+// 约定（V2）：
+// - Broadcast：用于“inv 公告”类的扇出广播（告诉别人“我有 tx/block 的摘要”）。
+// - Send：用于 Get*/* 这种“按需拉取”的定向请求/响应。
 type NetworkBus struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler
@@ -70,6 +74,8 @@ func (b *NetworkBus) SetDropRate(p float64) {
 }
 
 func (b *NetworkBus) Broadcast(from string, msg types.Message) {
+	// Broadcast 是“扇出”：除发送者外的所有节点都会收到。
+	// 延迟/丢包在这里注入（模拟真实网络的不确定性）。
 	b.mu.RLock()
 	delay := b.delay
 	dropRate := b.dropRate
@@ -97,6 +103,8 @@ func (b *NetworkBus) Broadcast(from string, msg types.Message) {
 }
 
 func (b *NetworkBus) Send(to string, msg types.Message) {
+	// Send 是“定向投递”：只发给指定节点。
+	// V2 的 Get*/* 交换依赖它来模拟“按需拉取”的请求-响应。
 	b.mu.RLock()
 	delay := b.delay
 	dropRate := b.dropRate

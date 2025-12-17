@@ -253,6 +253,11 @@ func (bc *Blockchain) tryConnectOrphansUnlocked() {
 }
 
 func (bc *Blockchain) computeReorgUnlocked(oldTip, newTip types.Hash) *Reorg {
+	// computeReorgUnlocked 只负责计算“差异段”：
+	// - CommonAncestor：两条链的共同祖先
+	// - Removed：旧主链上会被移除的那段块
+	// - Added：新主链上会被接入的那段块
+	// 具体如何修正 mempool 由 Node 层处理（退回 Removed 的交易，删除 Added 的交易）。
 	if oldTip == newTip {
 		return nil
 	}
@@ -319,6 +324,9 @@ func (bc *Blockchain) Locator(max int) []types.Hash {
 }
 
 func (bc *Blockchain) locatorUnlocked(max int) []types.Hash {
+	// locator 是 headers-first 同步的常用技巧：
+	// 从 tip 往回取若干个 hash，前面步长小、后面指数增大，
+	// 这样既能快速定位共同祖先，又不会传输过多数据。
 	if max <= 0 {
 		max = 32
 	}
@@ -343,6 +351,8 @@ func (bc *Blockchain) locatorUnlocked(max int) []types.Hash {
 }
 
 func (bc *Blockchain) MainChainMetasFromLocator(locator []types.Hash, max int) []types.BlockMeta {
+	// 给定对方的 locator，返回“共同祖先之后”的主链 BlockMeta（header+nonce+hash）。
+	// 这相当于极简版的 headers-first：对方用 metas 知道自己缺哪些 blockhash，再去拉完整区块。
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 	if max <= 0 {
@@ -407,6 +417,7 @@ func (bc *Blockchain) mainChainHashesUnlocked() []types.Hash {
 // MainChainBlocks returns up to limit blocks from the current main chain, oldest->newest.
 // If limit <= 0, it returns the full main chain.
 func (bc *Blockchain) MainChainBlocks(limit int) []*types.Block {
+	// 调试/可观测性用途：返回当前主链上的区块（带交易），用于打印“确认后的数据”。
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 

@@ -85,6 +85,7 @@ func main() {
 	}
 
 	logBlock := func(title string, lines []string) {
+		// 为了更直观，把一组相关信息聚合成一次 log 输出（多行一块），便于在控制台阅读/复制。
 		var b strings.Builder
 		b.WriteString(title)
 		for _, line := range lines {
@@ -119,6 +120,8 @@ func main() {
 		dumpMu.Lock()
 		defer dumpMu.Unlock()
 
+		// 注意：这里是“可观测性/调试”输出，和共识逻辑无关。
+		// 每当任意节点 tip 变化，就把所有节点的 mempool + 最近主链块打印出来。
 		nodesSnap := snapshotNodes()
 		if strings.EqualFold(*debugDumpFormatFlag, "json") {
 			type dump struct {
