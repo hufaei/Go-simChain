@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"simchain-go/internal/blockchain"
+	"simchain-go/internal/crypto"
 	"simchain-go/internal/peer"
 	"simchain-go/internal/transport"
 	"simchain-go/internal/types"
@@ -25,6 +26,8 @@ type Config struct {
 	Transport transport.Transport
 	Chain     *blockchain.Blockchain
 	Peers     *peer.Manager
+	HasTx     func(txid string) bool
+	OnTx      func(tx types.Transaction, fromPeer string) bool
 
 	SyncTimeout     time.Duration
 	MaxHeaders      int
@@ -41,6 +44,10 @@ type Config struct {
 // 后续 V3-A 会把 inv/get 的长期同步与 retry/window 也逐步搬入 Syncer。
 type Syncer struct {
 	cfg Config
+
+	mu            sync.Mutex
+	inflightBlock map[types.Hash]struct{}
+	inflightTx    map[string]struct{}
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -64,7 +71,156 @@ func New(cfg Config) *Syncer {
 	if cfg.Peers == nil {
 		cfg.Peers = peer.NewManager(800 * time.Millisecond)
 	}
-	return &Syncer{cfg: cfg}
+	return &Syncer{
+		cfg:           cfg,
+		inflightBlock: make(map[types.Hash]struct{}),
+		inflightTx:    make(map[string]struct{}),
+	}
+}
+
+// HandleInvBlock processes an incoming block announcement (meta).
+// It performs a cheap PoW check (header+nonce -> hash) and requests the full block only if needed.
+//
+// 说明：V3-A 先把 “是否拉取、向谁拉取、避免重复拉取” 迁到 Syncer，
+// 区块的完整校验与接入仍然由 Node/Chain 负责（通过 cfg.OnBlock 回调）。
+func (s *Syncer) HandleInvBlock(meta types.BlockMeta, fromPeer string) {
+	if s.cfg.Transport == nil || s.cfg.Chain == nil {
+		return
+	}
+	if fromPeer == "" || meta.Hash.IsZero() {
+		return
+	}
+	if s.cfg.Chain.HasBlock(meta.Hash) {
+		return
+	}
+	if meta.Header.Difficulty != s.cfg.Chain.Difficulty() {
+		return
+	}
+
+	// 轻校验 PoW：不下载 block body 的前提下先拒绝明显无效的公告。
+	computed, err := crypto.HashHeaderNonce(meta.Header, meta.Nonce)
+	if err != nil || computed != meta.Hash || !crypto.MeetsDifficulty(meta.Hash, s.cfg.Chain.Difficulty()) {
+		return
+	}
+
+	// 若父块未知，先尝试请求父块（best-effort）。
+	if meta.Header.Height > 0 && !meta.Header.PrevHash.IsZero() && !s.cfg.Chain.HasBlock(meta.Header.PrevHash) {
+		s.requestBlock(fromPeer, meta.Header.PrevHash)
+	}
+	s.requestBlock(fromPeer, meta.Hash)
+}
+
+// HandleBlock processes a full block response to a previous GetBlock request.
+// It clears inflight state and forwards the block to the chain via cfg.OnBlock.
+func (s *Syncer) HandleBlock(b *types.Block, fromPeer string) {
+	if b == nil || s.cfg.OnBlock == nil {
+		return
+	}
+	h := b.Hash
+	if h.IsZero() {
+		if computed, err := crypto.HashHeaderNonce(b.Header, b.Nonce); err == nil {
+			h = computed
+		}
+	}
+	s.mu.Lock()
+	delete(s.inflightBlock, h)
+	s.mu.Unlock()
+
+	s.cfg.OnBlock(b, fromPeer)
+}
+
+// HandleInvTx processes a tx announcement.
+// If we don't have the tx yet, request it from the announcing peer.
+func (s *Syncer) HandleInvTx(txid string, fromPeer string) {
+	if s.cfg.Transport == nil || txid == "" || fromPeer == "" {
+		return
+	}
+	if s.cfg.HasTx != nil && s.cfg.HasTx(txid) {
+		return
+	}
+
+	s.mu.Lock()
+	if _, ok := s.inflightTx[txid]; ok {
+		s.mu.Unlock()
+		return
+	}
+	s.inflightTx[txid] = struct{}{}
+	s.mu.Unlock()
+
+	time.AfterFunc(s.cfg.SyncTimeout, func() {
+		s.mu.Lock()
+		delete(s.inflightTx, txid)
+		s.mu.Unlock()
+	})
+
+	s.cfg.Transport.Send(fromPeer, types.Message{
+		Type:      types.MsgGetTx,
+		From:      s.cfg.NodeID,
+		To:        fromPeer,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   types.GetTxPayload{TxID: txid},
+	})
+}
+
+// HandleTx processes a full transaction response.
+// The actual mempool insert / dedupe is delegated to cfg.OnTx.
+func (s *Syncer) HandleTx(tx types.Transaction, fromPeer string) {
+	if tx.ID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.inflightTx, tx.ID)
+	s.mu.Unlock()
+
+	if s.cfg.OnTx == nil {
+		return
+	}
+	added := s.cfg.OnTx(tx, fromPeer)
+	if !added || s.cfg.Transport == nil {
+		return
+	}
+	// Gossip the txid further. Peers that already know it will ignore.
+	s.cfg.Transport.Broadcast(s.cfg.NodeID, types.Message{
+		Type:      types.MsgInvTx,
+		From:      s.cfg.NodeID,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   types.InvTxPayload{TxID: tx.ID},
+	})
+}
+
+func (s *Syncer) requestBlock(to string, h types.Hash) {
+	if s.cfg.Transport == nil || s.cfg.Chain == nil {
+		return
+	}
+	if to == "" || h.IsZero() {
+		return
+	}
+	if s.cfg.Chain.HasBlock(h) {
+		return
+	}
+
+	s.mu.Lock()
+	if _, ok := s.inflightBlock[h]; ok {
+		s.mu.Unlock()
+		return
+	}
+	s.inflightBlock[h] = struct{}{}
+	s.mu.Unlock()
+
+	// 超时后释放 inflight，允许后续重试（窗口/更复杂重试策略留到下一步状态机增强）。
+	time.AfterFunc(s.cfg.SyncTimeout, func() {
+		s.mu.Lock()
+		delete(s.inflightBlock, h)
+		s.mu.Unlock()
+	})
+
+	s.cfg.Transport.Send(to, types.Message{
+		Type:      types.MsgGetBlock,
+		From:      s.cfg.NodeID,
+		To:        to,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   types.GetBlockPayload{Hash: h},
+	})
 }
 
 // Start runs a background loop that:

@@ -76,11 +76,9 @@ type Node struct {
 	recvBlocks   uint64
 	hashAttempts uint64
 
-	mu            sync.Mutex
-	knownTxIDs    map[string]struct{}
-	txStore       map[string]types.Transaction
-	inflightTx    map[string]struct{}
-	inflightBlock map[types.Hash]struct{}
+	mu         sync.Mutex
+	knownTxIDs map[string]struct{}
+	txStore    map[string]types.Transaction
 
 	pendingRPC map[string]chan types.Message
 	rpcSeq     uint64
@@ -91,24 +89,22 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, tr tr
 		mp = mempool.NewMempool()
 	}
 	n := &Node{
-		id:            id,
-		chain:         chain,
-		mempool:       mp,
-		tr:            tr,
-		difficulty:    cfg.Difficulty,
-		maxTxPerBlk:   cfg.MaxTxPerBlock,
-		minerSleep:    cfg.MinerSleep,
-		syncTimeout:   cfg.SyncTimeout,
-		maxHeaders:    cfg.MaxHeaders,
-		blocksBatch:   cfg.GetBlocksBatchSize,
-		onTipChange:   cfg.OnTipChange,
-		stopCh:        make(chan struct{}),
-		doneCh:        make(chan struct{}),
-		knownTxIDs:    make(map[string]struct{}),
-		txStore:       make(map[string]types.Transaction),
-		inflightTx:    make(map[string]struct{}),
-		inflightBlock: make(map[types.Hash]struct{}),
-		pendingRPC:    make(map[string]chan types.Message),
+		id:          id,
+		chain:       chain,
+		mempool:     mp,
+		tr:          tr,
+		difficulty:  cfg.Difficulty,
+		maxTxPerBlk: cfg.MaxTxPerBlock,
+		minerSleep:  cfg.MinerSleep,
+		syncTimeout: cfg.SyncTimeout,
+		maxHeaders:  cfg.MaxHeaders,
+		blocksBatch: cfg.GetBlocksBatchSize,
+		onTipChange: cfg.OnTipChange,
+		stopCh:      make(chan struct{}),
+		doneCh:      make(chan struct{}),
+		knownTxIDs:  make(map[string]struct{}),
+		txStore:     make(map[string]types.Transaction),
+		pendingRPC:  make(map[string]chan types.Message),
 	}
 	if n.maxTxPerBlk <= 0 {
 		n.maxTxPerBlk = 50
@@ -135,6 +131,8 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, tr tr
 		SyncTimeout:     n.syncTimeout,
 		MaxHeaders:      n.maxHeaders,
 		BlocksBatchSize: n.blocksBatch,
+		HasTx:           n.hasTx,
+		OnTx:            n.acceptTxFromPeer,
 		RPC:             n.rpc,
 		OnBlock:         n.onNewBlock,
 	})
@@ -213,7 +211,9 @@ func (n *Node) HandleMessage(msg types.Message) {
 		if !ok {
 			return
 		}
-		n.onInvTx(pl.TxID, msg.From)
+		if n.syncer != nil {
+			n.syncer.HandleInvTx(pl.TxID, msg.From)
+		}
 	case types.MsgGetTx:
 		pl, ok := msg.Payload.(types.GetTxPayload)
 		if !ok {
@@ -225,13 +225,17 @@ func (n *Node) HandleMessage(msg types.Message) {
 		if !ok {
 			return
 		}
-		n.onTx(pl.Tx, msg.From)
+		if n.syncer != nil {
+			n.syncer.HandleTx(pl.Tx, msg.From)
+		}
 	case types.MsgInvBlock:
 		pl, ok := msg.Payload.(types.InvBlockPayload)
 		if !ok {
 			return
 		}
-		n.onInvBlock(pl.Meta, msg.From)
+		if n.syncer != nil {
+			n.syncer.HandleInvBlock(pl.Meta, msg.From)
+		}
 	case types.MsgGetBlock:
 		pl, ok := msg.Payload.(types.GetBlockPayload)
 		if !ok {
@@ -243,7 +247,11 @@ func (n *Node) HandleMessage(msg types.Message) {
 		if !ok || pl.Block == nil {
 			return
 		}
-		n.onBlock(pl.Block, msg.From)
+		if n.syncer != nil {
+			n.syncer.HandleBlock(pl.Block, msg.From)
+		} else {
+			n.onNewBlock(pl.Block, msg.From)
+		}
 	case types.MsgGetTip:
 		n.onGetTip(msg.From, msg.TraceID)
 	case types.MsgGetHeaders:
@@ -517,60 +525,6 @@ func (n *Node) hasTx(txid string) bool {
 	return ok
 }
 
-func (n *Node) markInflightTx(txid string) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if _, ok := n.inflightTx[txid]; ok {
-		return false
-	}
-	n.inflightTx[txid] = struct{}{}
-	return true
-}
-
-func (n *Node) clearInflightTx(txid string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	delete(n.inflightTx, txid)
-}
-
-func (n *Node) markInflightBlock(h types.Hash) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if _, ok := n.inflightBlock[h]; ok {
-		return false
-	}
-	n.inflightBlock[h] = struct{}{}
-	return true
-}
-
-func (n *Node) clearInflightBlock(h types.Hash) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	delete(n.inflightBlock, h)
-}
-
-func (n *Node) onInvTx(txid string, from string) {
-	if txid == "" || from == "" || n.tr == nil {
-		return
-	}
-	if n.hasTx(txid) {
-		return
-	}
-	if !n.markInflightTx(txid) {
-		return
-	}
-	time.AfterFunc(n.syncTimeout, func() {
-		n.clearInflightTx(txid)
-	})
-	n.tr.Send(from, types.Message{
-		Type:      types.MsgGetTx,
-		From:      n.id,
-		To:        from,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   types.GetTxPayload{TxID: txid},
-	})
-}
-
 func (n *Node) onGetTx(txid string, requester string) {
 	if txid == "" || requester == "" || n.tr == nil {
 		return
@@ -590,73 +544,25 @@ func (n *Node) onGetTx(txid string, requester string) {
 	})
 }
 
-func (n *Node) onTx(tx types.Transaction, from string) {
+// acceptTxFromPeer 由 Syncer 调用：收到对方发来的 Tx 消息后，
+// 由 Node 负责做最终的“是否接纳到本地”的决定（写入 mempool + 记录到本地 txStore）。
+//
+// 说明：
+// - 这里不做广播（InvTx gossip），由 Syncer.HandleTx 在 OnTx 返回 true 后统一处理。
+// - rememberTx 的作用是：后续有人 GetTx 时，我们可以把完整交易回给对方。
+func (n *Node) acceptTxFromPeer(tx types.Transaction, from string) bool {
 	if tx.ID == "" {
-		return
+		return false
 	}
-	n.clearInflightTx(tx.ID)
 	if n.hasTx(tx.ID) {
-		return
+		return false
 	}
 	if !n.mempool.Add(tx) {
-		return
+		return false
 	}
 	n.rememberTx(tx)
 	log.Printf("TX_ACCEPTED node=%s tx=%s (from=%s)", n.id, tx.ID, from)
-	if n.tr == nil {
-		return
-	}
-	n.tr.Broadcast(n.id, types.Message{
-		Type:      types.MsgInvTx,
-		From:      n.id,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   types.InvTxPayload{TxID: tx.ID},
-	})
-}
-
-func (n *Node) onInvBlock(meta types.BlockMeta, from string) {
-	if from == "" || n.tr == nil || n.chain == nil {
-		return
-	}
-	if meta.Hash.IsZero() {
-		return
-	}
-	if n.chain.HasBlock(meta.Hash) {
-		return
-	}
-	if meta.Header.Difficulty != n.difficulty {
-		return
-	}
-	// Validate PoW from header+nonce without downloading full block.
-	computed, err := crypto.HashHeaderNonce(meta.Header, meta.Nonce)
-	if err != nil || computed != meta.Hash || !crypto.MeetsDifficulty(meta.Hash, n.difficulty) {
-		return
-	}
-
-	// If parent is missing, request it first (best-effort).
-	if meta.Header.Height > 0 && !n.chain.HasBlock(meta.Header.PrevHash) && !meta.Header.PrevHash.IsZero() {
-		n.requestBlock(from, meta.Header.PrevHash)
-	}
-	n.requestBlock(from, meta.Hash)
-}
-
-func (n *Node) requestBlock(to string, h types.Hash) {
-	if to == "" || n.tr == nil || h.IsZero() {
-		return
-	}
-	if !n.markInflightBlock(h) {
-		return
-	}
-	time.AfterFunc(n.syncTimeout, func() {
-		n.clearInflightBlock(h)
-	})
-	n.tr.Send(to, types.Message{
-		Type:      types.MsgGetBlock,
-		From:      n.id,
-		To:        to,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   types.GetBlockPayload{Hash: h},
-	})
+	return true
 }
 
 func (n *Node) onGetBlock(h types.Hash, requester string) {
@@ -678,14 +584,6 @@ func (n *Node) onGetBlock(h types.Hash, requester string) {
 		Timestamp: time.Now().UnixMilli(),
 		Payload:   types.BlockPayload{Block: &cp},
 	})
-}
-
-func (n *Node) onBlock(b *types.Block, from string) {
-	if b == nil || n.chain == nil {
-		return
-	}
-	n.clearInflightBlock(b.Hash)
-	n.onNewBlock(b, from)
 }
 
 func (n *Node) onGetTip(requester string, traceID string) {

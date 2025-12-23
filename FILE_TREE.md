@@ -61,6 +61,8 @@
     - `internal/syncer/syncer.go`
       - 当前先承载 “late join 的 InitialSync” 逻辑（从 Node 迁出）
       - 已增加常驻循环：周期性探测 peers tip，选择 best peer 并在落后时做 headers-first catch-up（为后续完整状态机打底）
+      - **InvBlock 处理已迁入 Syncer**：轻校验 PoW 后决定是否发送 `GetBlock` 拉取完整区块，避免同步策略散落在 Node 中
+      - **InvTx 处理已迁入 Syncer**：收到 `InvTx(txid)` 后按需发送 `GetTx` 拉取完整交易，并用 inflight 去重；收到 `Tx` 后调用 `cfg.OnTx` 交由 Node 决定是否写入 mempool/txStore，接纳后再统一 gossip `InvTx`
   - `internal/peer/`（V3-A：peer 选择/退避）
     - `internal/peer/peermanager.go`
       - 维护每个 peer 的 tip/cumWork/RTT/超时与冷却窗口（backoff）
@@ -74,6 +76,6 @@
   - `internal/node/`（节点：挖矿 + 协议处理 + 编排）
     - `internal/node/node.go`
       - 挖矿：mempool 取交易 → PoW → `chain.AddBlock` → 广播 `InvBlock(meta)`
-      - 协议：处理 `InvTx/GetTx/Tx`、`InvBlock/GetBlock/Block`、同步请求 `GetTip/GetHeaders/GetBlocks`
+      - 协议：作为 `GetTx/GetBlock` 的响应提供者，并把 `InvTx/Tx`、`InvBlock/Block` 路由交给 `Syncer` 决定拉取/传播策略；同步请求 `GetTip/GetHeaders/GetBlocks`
       - V3-A：`InitialSync()` 现在委托给 `internal/syncer`（Node 更像 orchestrator）
       - 可观测：`DebugState()` 给 Runner 的 `STATE_DUMP` 使用
