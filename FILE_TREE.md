@@ -60,7 +60,8 @@
   - `internal/syncer/`（V3-A：同步器）
     - `internal/syncer/syncer.go`
       - 当前先承载 “late join 的 InitialSync” 逻辑（从 Node 迁出）
-      - 已增加常驻循环：周期性探测 peers tip，选择 best peer 并在落后时做 headers-first catch-up（为后续完整状态机打底）
+      - 已演进为明确状态机：`SyncingHeaders/SyncingBlocks/Backoff`，周期性探测 peers tip，落后时做 headers-first catch-up
+      - block 拉取窗口（in-flight window）：限制并发 `GetBlock` 数量、超时重试、必要时换 peer，避免丢包/不响应导致卡死
       - **InvBlock 处理已迁入 Syncer**：轻校验 PoW 后决定是否发送 `GetBlock` 拉取完整区块，避免同步策略散落在 Node 中
       - **InvTx 处理已迁入 Syncer**：收到 `InvTx(txid)` 后按需发送 `GetTx` 拉取完整交易，并用 inflight 去重；收到 `Tx` 后调用 `cfg.OnTx` 交由 Node 决定是否写入 mempool/txStore，接纳后再统一 gossip `InvTx`
   - `internal/peer/`（V3-A：peer 选择/退避）

@@ -12,6 +12,36 @@ import (
 	"simchain-go/internal/types"
 )
 
+type syncState uint8
+
+const (
+	syncIdle syncState = iota
+	syncingHeaders
+	syncingBlocks
+	syncBackoff
+)
+
+type blockReqKind uint8
+
+const (
+	blkSync blockReqKind = iota
+	blkInv
+	blkParent
+)
+
+type inflightBlockReq struct {
+	peer     string
+	kind     blockReqKind
+	attempts int
+	deadline time.Time
+}
+
+type headersResult struct {
+	peer  string
+	ok    bool
+	metas []types.BlockMeta
+}
+
 // RPCFunc is a single-request/single-response helper used by InitialSync.
 // It is intentionally small: V3-A will later evolve this into a persistent Syncer state machine.
 type RPCFunc func(to string, typ types.MessageType, payload any, timeout time.Duration) (types.Message, bool)
@@ -34,6 +64,16 @@ type Config struct {
 	BlocksBatchSize int
 	ProbeInterval   time.Duration
 
+	// V3-A: headers-first catch-up 的状态机参数
+	// MaxInflightBlocks：同时在路上的 GetBlock 数量上限（窗口大小）
+	// BlockRetryLimit：单个区块 GetBlock 超时后最多重试次数（含首次）
+	// HeaderRetryLimit：GetHeaders 超时后最多重试次数（含首次）
+	// BackoffDuration：同步失败后的冷却时间（避免一直打同一个 peer）
+	MaxInflightBlocks int
+	BlockRetryLimit   int
+	HeaderRetryLimit  int
+	BackoffDuration   time.Duration
+
 	RPC     RPCFunc
 	OnBlock OnBlockFunc
 }
@@ -45,9 +85,28 @@ type Config struct {
 type Syncer struct {
 	cfg Config
 
-	mu            sync.Mutex
-	inflightBlock map[types.Hash]struct{}
-	inflightTx    map[string]struct{}
+	mu sync.Mutex
+
+	// -------- block fetch (inv + sync 共用) --------
+	inflightBlocks map[types.Hash]*inflightBlockReq
+	inflightTx     map[string]struct{}
+
+	queueParent []types.Hash
+	queueSync   []types.Hash
+	queueInv    []types.Hash
+
+	queuedParent map[types.Hash]string
+	queuedSync   map[types.Hash]string
+	queuedInv    map[types.Hash]string
+
+	// -------- headers-first catch-up 状态机 --------
+	state        syncState
+	syncPeer     string
+	backoffUntil time.Time
+
+	headerReqInFlight bool
+	headerRetries     int
+	headersCh         chan headersResult
 
 	stopCh  chan struct{}
 	doneCh  chan struct{}
@@ -68,13 +127,32 @@ func New(cfg Config) *Syncer {
 	if cfg.ProbeInterval <= 0 {
 		cfg.ProbeInterval = 900 * time.Millisecond
 	}
+	if cfg.MaxInflightBlocks <= 0 {
+		cfg.MaxInflightBlocks = 16
+	}
+	if cfg.BlockRetryLimit <= 0 {
+		cfg.BlockRetryLimit = 3
+	}
+	if cfg.HeaderRetryLimit <= 0 {
+		cfg.HeaderRetryLimit = 2
+	}
+	if cfg.BackoffDuration <= 0 {
+		cfg.BackoffDuration = 1200 * time.Millisecond
+	}
 	if cfg.Peers == nil {
 		cfg.Peers = peer.NewManager(800 * time.Millisecond)
 	}
 	return &Syncer{
-		cfg:           cfg,
-		inflightBlock: make(map[types.Hash]struct{}),
-		inflightTx:    make(map[string]struct{}),
+		cfg: cfg,
+
+		inflightBlocks: make(map[types.Hash]*inflightBlockReq),
+		inflightTx:     make(map[string]struct{}),
+
+		queuedParent: make(map[types.Hash]string),
+		queuedSync:   make(map[types.Hash]string),
+		queuedInv:    make(map[types.Hash]string),
+
+		headersCh: make(chan headersResult, 1),
 	}
 }
 
@@ -105,9 +183,11 @@ func (s *Syncer) HandleInvBlock(meta types.BlockMeta, fromPeer string) {
 
 	// 若父块未知，先尝试请求父块（best-effort）。
 	if meta.Header.Height > 0 && !meta.Header.PrevHash.IsZero() && !s.cfg.Chain.HasBlock(meta.Header.PrevHash) {
-		s.requestBlock(fromPeer, meta.Header.PrevHash)
+		s.enqueueBlock(meta.Header.PrevHash, fromPeer, blkParent)
 	}
-	s.requestBlock(fromPeer, meta.Hash)
+	s.enqueueBlock(meta.Hash, fromPeer, blkInv)
+	// 收到 inv 后尽量立刻发出请求（受窗口限制）
+	s.dispatchQueuedBlocks(time.Now())
 }
 
 // HandleBlock processes a full block response to a previous GetBlock request.
@@ -122,9 +202,7 @@ func (s *Syncer) HandleBlock(b *types.Block, fromPeer string) {
 			h = computed
 		}
 	}
-	s.mu.Lock()
-	delete(s.inflightBlock, h)
-	s.mu.Unlock()
+	s.onBlockArrived(h)
 
 	s.cfg.OnBlock(b, fromPeer)
 }
@@ -188,11 +266,8 @@ func (s *Syncer) HandleTx(tx types.Transaction, fromPeer string) {
 	})
 }
 
-func (s *Syncer) requestBlock(to string, h types.Hash) {
-	if s.cfg.Transport == nil || s.cfg.Chain == nil {
-		return
-	}
-	if to == "" || h.IsZero() {
+func (s *Syncer) enqueueBlock(h types.Hash, preferredPeer string, kind blockReqKind) {
+	if s.cfg.Transport == nil || s.cfg.Chain == nil || h.IsZero() {
 		return
 	}
 	if s.cfg.Chain.HasBlock(h) {
@@ -200,27 +275,128 @@ func (s *Syncer) requestBlock(to string, h types.Hash) {
 	}
 
 	s.mu.Lock()
-	if _, ok := s.inflightBlock[h]; ok {
+	if _, ok := s.inflightBlocks[h]; ok {
 		s.mu.Unlock()
 		return
 	}
-	s.inflightBlock[h] = struct{}{}
+	switch kind {
+	case blkParent:
+		if _, ok := s.queuedParent[h]; ok {
+			s.mu.Unlock()
+			return
+		}
+		s.queuedParent[h] = preferredPeer
+		s.queueParent = append(s.queueParent, h)
+	case blkSync:
+		if _, ok := s.queuedSync[h]; ok {
+			s.mu.Unlock()
+			return
+		}
+		s.queuedSync[h] = preferredPeer
+		s.queueSync = append(s.queueSync, h)
+	default:
+		if _, ok := s.queuedInv[h]; ok {
+			s.mu.Unlock()
+			return
+		}
+		s.queuedInv[h] = preferredPeer
+		s.queueInv = append(s.queueInv, h)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Syncer) popNextQueuedLocked() (h types.Hash, peerID string, kind blockReqKind, ok bool) {
+	for len(s.queueParent) > 0 {
+		h = s.queueParent[0]
+		s.queueParent = s.queueParent[1:]
+		peerID, ok = s.queuedParent[h]
+		if !ok {
+			continue
+		}
+		delete(s.queuedParent, h)
+		return h, peerID, blkParent, true
+	}
+	for len(s.queueSync) > 0 {
+		h = s.queueSync[0]
+		s.queueSync = s.queueSync[1:]
+		peerID, ok = s.queuedSync[h]
+		if !ok {
+			continue
+		}
+		delete(s.queuedSync, h)
+		return h, peerID, blkSync, true
+	}
+	for len(s.queueInv) > 0 {
+		h = s.queueInv[0]
+		s.queueInv = s.queueInv[1:]
+		peerID, ok = s.queuedInv[h]
+		if !ok {
+			continue
+		}
+		delete(s.queuedInv, h)
+		return h, peerID, blkInv, true
+	}
+	return types.Hash{}, "", 0, false
+}
+
+func (s *Syncer) dispatchQueuedBlocks(now time.Time) {
+	if s.cfg.Transport == nil || s.cfg.Chain == nil {
+		return
+	}
+	bestPeer, _, _, _ := s.cfg.Peers.BestPeer(now)
+
+	type sendReq struct {
+		to string
+		h  types.Hash
+	}
+	sends := make([]sendReq, 0, 8)
+
+	s.mu.Lock()
+	for len(s.inflightBlocks) < s.cfg.MaxInflightBlocks {
+		h, peerID, kind, ok := s.popNextQueuedLocked()
+		if !ok {
+			break
+		}
+		if s.cfg.Chain.HasBlock(h) {
+			continue
+		}
+		if _, ok := s.inflightBlocks[h]; ok {
+			continue
+		}
+		if peerID == "" {
+			peerID = bestPeer
+		}
+		if peerID == "" || peerID == s.cfg.NodeID {
+			continue
+		}
+		s.inflightBlocks[h] = &inflightBlockReq{
+			peer:     peerID,
+			kind:     kind,
+			attempts: 1,
+			deadline: now.Add(s.cfg.SyncTimeout),
+		}
+		sends = append(sends, sendReq{to: peerID, h: h})
+	}
 	s.mu.Unlock()
 
-	// 超时后释放 inflight，允许后续重试（窗口/更复杂重试策略留到下一步状态机增强）。
-	time.AfterFunc(s.cfg.SyncTimeout, func() {
-		s.mu.Lock()
-		delete(s.inflightBlock, h)
-		s.mu.Unlock()
-	})
+	for _, r := range sends {
+		s.cfg.Transport.Send(r.to, types.Message{
+			Type:      types.MsgGetBlock,
+			From:      s.cfg.NodeID,
+			To:        r.to,
+			Timestamp: time.Now().UnixMilli(),
+			Payload:   types.GetBlockPayload{Hash: r.h},
+		})
+	}
+}
 
-	s.cfg.Transport.Send(to, types.Message{
-		Type:      types.MsgGetBlock,
-		From:      s.cfg.NodeID,
-		To:        to,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   types.GetBlockPayload{Hash: h},
-	})
+func (s *Syncer) onBlockArrived(h types.Hash) {
+	if h.IsZero() {
+		return
+	}
+	s.mu.Lock()
+	delete(s.inflightBlocks, h)
+	s.mu.Unlock()
 }
 
 // Start runs a background loop that:
@@ -274,30 +450,50 @@ func (s *Syncer) probeTips() {
 		return
 	}
 	peers := s.cfg.Transport.Peers()
+	type tipRes struct {
+		peer   string
+		ok     bool
+		height uint64
+		hash   types.Hash
+		work   *big.Int
+		rtt    time.Duration
+	}
+	ch := make(chan tipRes, len(peers))
+	n := 0
 	for _, p := range peers {
 		if p == "" || p == s.cfg.NodeID {
 			continue
 		}
+		n++
 		s.cfg.Peers.Upsert(p)
-
-		start := time.Now()
-		resp, ok := s.cfg.RPC(p, types.MsgGetTip, types.GetTipPayload{}, s.cfg.SyncTimeout)
-		rtt := time.Since(start)
-		if !ok || resp.Type != types.MsgTip {
-			s.cfg.Peers.ReportTimeout(p)
+		go func(peerID string) {
+			start := time.Now()
+			resp, ok := s.cfg.RPC(peerID, types.MsgGetTip, types.GetTipPayload{}, s.cfg.SyncTimeout)
+			rtt := time.Since(start)
+			if !ok || resp.Type != types.MsgTip {
+				ch <- tipRes{peer: peerID, ok: false}
+				return
+			}
+			pl, ok := resp.Payload.(types.TipPayload)
+			if !ok {
+				ch <- tipRes{peer: peerID, ok: false}
+				return
+			}
+			w := new(big.Int)
+			if _, ok := w.SetString(pl.CumWork, 10); !ok {
+				ch <- tipRes{peer: peerID, ok: false}
+				return
+			}
+			ch <- tipRes{peer: peerID, ok: true, height: pl.TipHeight, hash: pl.TipHash, work: w, rtt: rtt}
+		}(p)
+	}
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if !r.ok || r.work == nil {
+			s.cfg.Peers.ReportTimeout(r.peer)
 			continue
 		}
-		pl, ok := resp.Payload.(types.TipPayload)
-		if !ok {
-			s.cfg.Peers.ReportError(p)
-			continue
-		}
-		w := new(big.Int)
-		if _, ok := w.SetString(pl.CumWork, 10); !ok {
-			s.cfg.Peers.ReportError(p)
-			continue
-		}
-		s.cfg.Peers.UpdateTip(p, pl.TipHeight, pl.TipHash, w, rtt)
+		s.cfg.Peers.UpdateTip(r.peer, r.height, r.hash, r.work, r.rtt)
 	}
 }
 
@@ -306,16 +502,270 @@ func (s *Syncer) catchUpIfBehind() {
 		return
 	}
 	now := time.Now()
+
+	// 先处理 inflight 的超时重试（不依赖当前同步状态）
+	s.tickInflight(now)
+	// 再把队列尽量打满窗口（parent > sync > inv）
+	s.dispatchQueuedBlocks(now)
+	// 处理 headers RPC 的异步结果（会把状态从 syncingHeaders 推进到 syncingBlocks）
+	s.drainHeaderResults(now)
+
+	s.mu.Lock()
+	if s.state == syncBackoff && now.After(s.backoffUntil) {
+		s.state = syncIdle
+		s.syncPeer = ""
+		s.headerRetries = 0
+		s.headerReqInFlight = false
+	}
+	s.mu.Unlock()
+
 	bestPeer, bestHeight, _, bestWork := s.cfg.Peers.BestPeer(now)
 	if bestPeer == "" || bestWork == nil {
 		return
 	}
 	localWork := s.cfg.Chain.TipCumWork()
-	if localWork.Cmp(bestWork) >= 0 && s.cfg.Chain.TipHeight() >= bestHeight {
+	behind := localWork.Cmp(bestWork) < 0 || s.cfg.Chain.TipHeight() < bestHeight
+	if !behind {
+		s.resetSyncState()
 		return
 	}
-	// Do a catch-up pass. If it fails, PeerManager will backoff this peer via report calls.
-	s.InitialSyncFrom(bestPeer, bestHeight, bestWork)
+
+	s.mu.Lock()
+	if s.state == syncIdle {
+		s.state = syncingHeaders
+		s.syncPeer = bestPeer
+		s.headerRetries = 0
+	}
+	state := s.state
+	peerID := s.syncPeer
+	s.mu.Unlock()
+	if peerID == "" {
+		peerID = bestPeer
+	}
+
+	switch state {
+	case syncingHeaders:
+		s.maybeStartHeaderRequest(peerID)
+	case syncingBlocks:
+		if s.syncWorkDone() {
+			s.mu.Lock()
+			if s.state == syncingBlocks {
+				s.state = syncingHeaders
+			}
+			s.mu.Unlock()
+		}
+	default:
+	}
+}
+
+func (s *Syncer) resetSyncState() {
+	s.mu.Lock()
+	s.state = syncIdle
+	s.syncPeer = ""
+	s.headerRetries = 0
+	s.headerReqInFlight = false
+	// 只清理“同步用”的工作，不影响 inv/parent 的下载。
+	s.queueSync = nil
+	s.queuedSync = make(map[types.Hash]string)
+	for h, req := range s.inflightBlocks {
+		if req != nil && req.kind == blkSync {
+			delete(s.inflightBlocks, h)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func (s *Syncer) syncWorkDone() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.queuedSync) > 0 {
+		return false
+	}
+	for _, req := range s.inflightBlocks {
+		if req != nil && req.kind == blkSync {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Syncer) maybeStartHeaderRequest(peerID string) {
+	if s.cfg.RPC == nil || s.cfg.Chain == nil || peerID == "" || peerID == s.cfg.NodeID {
+		return
+	}
+	s.mu.Lock()
+	if s.state != syncingHeaders || s.headerReqInFlight {
+		s.mu.Unlock()
+		return
+	}
+	s.headerReqInFlight = true
+	if s.syncPeer == "" {
+		s.syncPeer = peerID
+	}
+	s.mu.Unlock()
+
+	locator := s.cfg.Chain.Locator(32)
+	payload := types.GetHeadersPayload{Locator: locator, Max: s.cfg.MaxHeaders}
+	timeout := s.cfg.SyncTimeout
+
+	go func() {
+		resp, ok := s.cfg.RPC(peerID, types.MsgGetHeaders, payload, timeout)
+		if !ok || resp.Type != types.MsgHeaders {
+			select {
+			case s.headersCh <- headersResult{peer: peerID, ok: false}:
+			case <-s.stopCh:
+			}
+			return
+		}
+		pl, ok := resp.Payload.(types.HeadersPayload)
+		if !ok {
+			select {
+			case s.headersCh <- headersResult{peer: peerID, ok: false}:
+			case <-s.stopCh:
+			}
+			return
+		}
+		select {
+		case s.headersCh <- headersResult{peer: peerID, ok: true, metas: pl.Metas}:
+		case <-s.stopCh:
+		}
+	}()
+}
+
+func (s *Syncer) drainHeaderResults(now time.Time) {
+	for {
+		select {
+		case r := <-s.headersCh:
+			s.mu.Lock()
+			s.headerReqInFlight = false
+			s.mu.Unlock()
+
+			if !r.ok {
+				if r.peer != "" {
+					s.cfg.Peers.ReportTimeout(r.peer)
+				}
+				shouldBackoff := false
+				s.mu.Lock()
+				s.headerRetries++
+				if s.headerRetries >= s.cfg.HeaderRetryLimit {
+					shouldBackoff = true
+				}
+				s.mu.Unlock()
+				if shouldBackoff {
+					s.enterBackoff(now)
+				}
+				continue
+			}
+
+			// 成功拿到 headers：把缺失块放进 sync 队列（具体拉取由窗口/重试机制统一处理）
+			s.mu.Lock()
+			s.headerRetries = 0
+			s.mu.Unlock()
+
+			queuedAny := false
+			for _, m := range r.metas {
+				if m.Hash.IsZero() {
+					continue
+				}
+				if s.cfg.Chain != nil && s.cfg.Chain.HasBlock(m.Hash) {
+					continue
+				}
+				s.enqueueBlock(m.Hash, r.peer, blkSync)
+				queuedAny = true
+			}
+			if queuedAny {
+				s.mu.Lock()
+				if s.state == syncingHeaders {
+					s.state = syncingBlocks
+				}
+				if s.syncPeer == "" {
+					s.syncPeer = r.peer
+				}
+				s.mu.Unlock()
+				s.dispatchQueuedBlocks(now)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func (s *Syncer) tickInflight(now time.Time) {
+	if s.cfg.Transport == nil || s.cfg.Chain == nil || len(s.inflightBlocks) == 0 {
+		return
+	}
+	bestPeer, _, _, _ := s.cfg.Peers.BestPeer(now)
+
+	type sendReq struct {
+		to string
+		h  types.Hash
+	}
+	sends := make([]sendReq, 0, 8)
+	timeouts := make([]string, 0, 8)
+	syncFailed := false
+
+	s.mu.Lock()
+	for h, req := range s.inflightBlocks {
+		if req == nil || now.Before(req.deadline) {
+			continue
+		}
+		if req.peer != "" {
+			timeouts = append(timeouts, req.peer)
+		}
+		if req.attempts >= s.cfg.BlockRetryLimit {
+			if req.kind == blkSync && (s.state == syncingBlocks || s.state == syncingHeaders) {
+				syncFailed = true
+			}
+			delete(s.inflightBlocks, h)
+			continue
+		}
+		peerID := req.peer
+		if bestPeer != "" {
+			peerID = bestPeer
+		}
+		req.peer = peerID
+		req.attempts++
+		req.deadline = now.Add(s.cfg.SyncTimeout)
+		if peerID != "" && peerID != s.cfg.NodeID {
+			sends = append(sends, sendReq{to: peerID, h: h})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, p := range timeouts {
+		s.cfg.Peers.ReportTimeout(p)
+	}
+	for _, r := range sends {
+		s.cfg.Transport.Send(r.to, types.Message{
+			Type:      types.MsgGetBlock,
+			From:      s.cfg.NodeID,
+			To:        r.to,
+			Timestamp: time.Now().UnixMilli(),
+			Payload:   types.GetBlockPayload{Hash: r.h},
+		})
+	}
+	if syncFailed {
+		s.enterBackoff(now)
+	}
+}
+
+func (s *Syncer) enterBackoff(now time.Time) {
+	s.mu.Lock()
+	s.state = syncBackoff
+	s.backoffUntil = now.Add(s.cfg.BackoffDuration)
+	s.syncPeer = ""
+	s.headerRetries = 0
+	s.headerReqInFlight = false
+
+	// 清掉同步队列与同步 inflight，让下一轮能换 peer 重新来。
+	s.queueSync = nil
+	s.queuedSync = make(map[types.Hash]string)
+	for h, req := range s.inflightBlocks {
+		if req != nil && req.kind == blkSync {
+			delete(s.inflightBlocks, h)
+		}
+	}
+	s.mu.Unlock()
 }
 
 // InitialSync pulls missing headers/blocks from the best available peer.
