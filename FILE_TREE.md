@@ -59,7 +59,7 @@
 
   - `internal/syncer/`（V3-A：同步器）
     - `internal/syncer/syncer.go`
-      - 当前先承载 “late join 的 InitialSync” 逻辑（从 Node 迁出）
+      - late join/落后同步：由后台状态机持续执行 headers-first catch-up（不再依赖一次性 `InitialSync()`）
       - 已演进为明确状态机：`SyncingHeaders/SyncingBlocks/Backoff`，周期性探测 peers tip，落后时做 headers-first catch-up
       - block 拉取窗口（in-flight window）：限制并发 `GetBlock` 数量、超时重试、必要时换 peer，避免丢包/不响应导致卡死
       - **InvBlock 处理已迁入 Syncer**：轻校验 PoW 后决定是否发送 `GetBlock` 拉取完整区块，避免同步策略散落在 Node 中
@@ -78,5 +78,5 @@
     - `internal/node/node.go`
       - 挖矿：mempool 取交易 → PoW → `chain.AddBlock` → 广播 `InvBlock(meta)`
       - 协议：作为 `GetTx/GetBlock` 的响应提供者，并把 `InvTx/Tx`、`InvBlock/Block` 路由交给 `Syncer` 决定拉取/传播策略；同步请求 `GetTip/GetHeaders/GetBlocks`
-      - V3-A：`InitialSync()` 现在委托给 `internal/syncer`（Node 更像 orchestrator）
+      - V3-A：同步由 `Syncer.Start()` 后的后台状态机负责（Node 更像 orchestrator）
       - 可观测：`DebugState()` 给 Runner 的 `STATE_DUMP` 使用

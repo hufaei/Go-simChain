@@ -701,15 +701,3 @@ func (n *Node) rpc(to string, typ types.MessageType, payload any, timeout time.D
 		return types.Message{}, false
 	}
 }
-
-// InitialSync pulls missing headers/blocks from the best available peer.
-// It is intended for "late join" nodes that start with only genesis.
-func (n *Node) InitialSync() {
-	// V3-A：initial sync 由 Syncer 负责，Node 只做编排。
-	if n.syncer == nil {
-		return
-	}
-	log.Printf("SYNC_START node=%s", n.id)
-	n.syncer.InitialSync()
-	log.Printf("SYNC_DONE node=%s height=%d tip=%s", n.id, n.chain.TipHeight(), n.chain.TipHash().String())
-}

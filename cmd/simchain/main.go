@@ -232,7 +232,6 @@ func main() {
 				}
 				n := newNode(i)
 				addNode(n)
-				n.InitialSync()
 				n.StartSync()
 				n.StartMining()
 				log.Printf("NODE_JOINED node=%s", n.ID())

@@ -33,7 +33,7 @@ V3-A 的明确取舍（已选定）：
 - 调试：tip 变化触发的全网 `STATE_DUMP` 与结束 `SIMULATION_SUMMARY`。
 
 V3-A 的核心问题不是“缺功能”，而是把这些功能 **工程化**：
-- 把 `InitialSync()` 从 Node 中抽离成长期运行的 Syncer；
+- 把 “一次性的 InitialSync” 演进成 **长期运行的 Syncer 状态机**（Start 后持续追链）；
 - 把“请求-响应 + retry + window + peer 选择”做成可理解的状态机；
 - 把“确认后的主链数据”写入磁盘并支持重启恢复。
 
@@ -56,7 +56,7 @@ Node (orchestrator)
 
 关键原则：
 - **Transport 负责投递，PeerManager 负责选择**：上层不直接依赖 `NetworkBus`。
-- **Syncer 负责“追上网络”**：不再是一次性的 `InitialSync()`，而是一个可以持续运行的循环（也能处理丢包/延迟）。
+- **Syncer 负责“追上网络”**：`Start()` 后持续运行的状态机（也能处理丢包/延迟），不依赖一次性同步函数。
 - **Store 只保存主链**：在 tip 变化时应用增量写入（append 或 reorg rollback）。
 
 ---
@@ -202,7 +202,7 @@ Node 在 V3-A 中应尽量“薄”：
 
 1) 抽 `Transport` 接口并用 inproc 实现适配（不改变行为）
 2) 引入 `PeerManager`（先让它只负责 best peer 选择）
-3) 把 `InitialSync()` 重构为 `Syncer`（状态机 + window + retry）
+3) 把追链逻辑重构为 `Syncer`（状态机 + window + retry，Start 后持续追链）
 4) 引入 `Store`（仅主链持久化），完成“重启恢复 tip + 继续同步”
 5) （可选）把 debug dump 从 runner 回调迁移成统一的 “Event Log” 模块（结构化输出）
 
@@ -214,4 +214,3 @@ Node 在 V3-A 中应尽量“薄”：
 - 重启恢复：kill 进程后重启，节点能从磁盘恢复 tip，并继续同步到最新
 - reorg 持久化：发生 reorg 后磁盘上只保留新主链（旧主链分支段被回滚删除）
 - 可观测：日志清晰，不影响共识与同步逻辑
-

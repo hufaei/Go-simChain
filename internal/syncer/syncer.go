@@ -42,8 +42,8 @@ type headersResult struct {
 	metas []types.BlockMeta
 }
 
-// RPCFunc is a single-request/single-response helper used by InitialSync.
-// It is intentionally small: V3-A will later evolve this into a persistent Syncer state machine.
+// RPCFunc is a single-request/single-response helper used by Syncer.
+// It stays intentionally small: most sync logic lives in Syncer; Node only provides routing + final AddBlock.
 type RPCFunc func(to string, typ types.MessageType, payload any, timeout time.Duration) (types.Message, bool)
 
 // OnBlockFunc is called for each downloaded full block during sync.
@@ -80,8 +80,8 @@ type Config struct {
 
 // Syncer is responsible for keeping a node's chain up to date.
 //
-// 当前只先迁移 V2 的 InitialSync（late join 追链逻辑）到这里；
-// 后续 V3-A 会把 inv/get 的长期同步与 retry/window 也逐步搬入 Syncer。
+// V3-A：Syncer 负责长期追链（headers-first + window + retry + peer backoff），
+// 同时接管 inv/get 的“拉取/重试/向谁拉”的策略；Node 只做路由 + 最终 AddBlock。
 type Syncer struct {
 	cfg Config
 
@@ -413,6 +413,12 @@ func (s *Syncer) Start() {
 	s.stopCh = make(chan struct{})
 	s.doneCh = make(chan struct{})
 	go s.loop()
+
+	// 尽快推进一次：新节点加入时不必等待第一个 ticker tick 才开始探测/追链。
+	go func() {
+		s.probeTips()
+		s.catchUpIfBehind()
+	}()
 }
 
 func (s *Syncer) Stop() {
@@ -766,121 +772,4 @@ func (s *Syncer) enterBackoff(now time.Time) {
 		}
 	}
 	s.mu.Unlock()
-}
-
-// InitialSync pulls missing headers/blocks from the best available peer.
-// It is intended for "late join" nodes that start with only genesis or lag behind.
-func (s *Syncer) InitialSync() {
-	if s.cfg.Transport == nil || s.cfg.Chain == nil || s.cfg.RPC == nil || s.cfg.OnBlock == nil {
-		return
-	}
-
-	peers := s.cfg.Transport.Peers()
-	candidates := make([]string, 0, len(peers))
-	for _, p := range peers {
-		if p != s.cfg.NodeID {
-			candidates = append(candidates, p)
-		}
-	}
-	if len(candidates) == 0 {
-		return
-	}
-
-	type tipInfo struct {
-		peer   string
-		height uint64
-		work   *big.Int
-		hash   types.Hash
-	}
-
-	var best tipInfo
-	best.work = big.NewInt(-1)
-	for _, p := range candidates {
-		resp, ok := s.cfg.RPC(p, types.MsgGetTip, types.GetTipPayload{}, s.cfg.SyncTimeout)
-		if !ok || resp.Type != types.MsgTip {
-			continue
-		}
-		pl, ok := resp.Payload.(types.TipPayload)
-		if !ok {
-			continue
-		}
-		w := new(big.Int)
-		if _, ok := w.SetString(pl.CumWork, 10); !ok {
-			continue
-		}
-		if best.peer == "" || w.Cmp(best.work) > 0 || (w.Cmp(best.work) == 0 && pl.TipHeight > best.height) {
-			best = tipInfo{peer: p, height: pl.TipHeight, work: w, hash: pl.TipHash}
-		}
-	}
-
-	if best.peer == "" {
-		return
-	}
-
-	s.InitialSyncFrom(best.peer, best.height, best.work)
-}
-
-// InitialSyncFrom performs a headers-first catch up from a specific peer snapshot.
-func (s *Syncer) InitialSyncFrom(peerID string, peerHeight uint64, peerWork *big.Int) {
-	if peerID == "" || s.cfg.Transport == nil || s.cfg.Chain == nil || s.cfg.RPC == nil || s.cfg.OnBlock == nil {
-		return
-	}
-	if peerWork == nil {
-		peerWork = big.NewInt(0)
-	}
-
-	for {
-		// Allow Stop() to interrupt long sync runs.
-		select {
-		case <-s.stopCh:
-			return
-		default:
-		}
-
-		localWork := s.cfg.Chain.TipCumWork()
-		if localWork.Cmp(peerWork) >= 0 && s.cfg.Chain.TipHeight() >= peerHeight {
-			return
-		}
-
-		locator := s.cfg.Chain.Locator(32)
-		resp, ok := s.cfg.RPC(peerID, types.MsgGetHeaders, types.GetHeadersPayload{Locator: locator, Max: s.cfg.MaxHeaders}, s.cfg.SyncTimeout)
-		if !ok || resp.Type != types.MsgHeaders {
-			s.cfg.Peers.ReportTimeout(peerID)
-			return
-		}
-		hpl, ok := resp.Payload.(types.HeadersPayload)
-		if !ok || len(hpl.Metas) == 0 {
-			return
-		}
-
-		hashes := make([]types.Hash, 0, len(hpl.Metas))
-		for _, m := range hpl.Metas {
-			if m.Hash.IsZero() || s.cfg.Chain.HasBlock(m.Hash) {
-				continue
-			}
-			hashes = append(hashes, m.Hash)
-		}
-
-		for i := 0; i < len(hashes); i += s.cfg.BlocksBatchSize {
-			end := i + s.cfg.BlocksBatchSize
-			if end > len(hashes) {
-				end = len(hashes)
-			}
-			bresp, ok := s.cfg.RPC(peerID, types.MsgGetBlocks, types.GetBlocksPayload{Hashes: hashes[i:end]}, s.cfg.SyncTimeout)
-			if !ok || bresp.Type != types.MsgBlocks {
-				s.cfg.Peers.ReportTimeout(peerID)
-				return
-			}
-			bpl, ok := bresp.Payload.(types.BlocksPayload)
-			if !ok {
-				s.cfg.Peers.ReportError(peerID)
-				return
-			}
-			for _, b := range bpl.Blocks {
-				if b != nil {
-					s.cfg.OnBlock(b, peerID)
-				}
-			}
-		}
-	}
 }
