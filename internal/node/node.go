@@ -266,6 +266,14 @@ func (n *Node) HandleMessage(msg types.Message) {
 			return
 		}
 		n.onGetBlocks(pl, msg.From, msg.TraceID)
+	case types.MsgBlocks:
+		pl, ok := msg.Payload.(types.BlocksPayload)
+		if !ok {
+			return
+		}
+		if n.syncer != nil {
+			n.syncer.HandleBlocks(pl.Blocks, msg.From)
+		}
 	default:
 	}
 }
@@ -624,7 +632,7 @@ func (n *Node) onGetHeaders(req types.GetHeadersPayload, requester string, trace
 }
 
 func (n *Node) onGetBlocks(req types.GetBlocksPayload, requester string, traceID string) {
-	if requester == "" || traceID == "" || n.tr == nil || n.chain == nil {
+	if requester == "" || n.tr == nil || n.chain == nil {
 		return
 	}
 	blocks := make([]*types.Block, 0, len(req.Hashes))

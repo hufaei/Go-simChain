@@ -117,6 +117,20 @@ func (s *Store) LoadMainChain() ([]*types.Block, error) {
 	for h := uint64(0); h <= s.manifest.TipHeight; h++ {
 		b, err := s.readBlockFile(h)
 		if err != nil {
+			// 容错：若磁盘上缺失某个高度的块文件（例如上次写入中断），
+			// 则按“已存在的最后连续高度”截断，并修正 manifest，剩余部分通过网络同步补齐。
+			if os.IsNotExist(err) {
+				if h == 0 {
+					return nil, err
+				}
+				last := h - 1
+				s.manifest.TipHeight = last
+				if len(out) > 0 && out[len(out)-1] != nil {
+					s.manifest.TipHash = out[len(out)-1].Hash
+				}
+				_ = s.saveManifest()
+				break
+			}
 			return nil, err
 		}
 		out = append(out, b)

@@ -207,6 +207,27 @@ func (s *Syncer) HandleBlock(b *types.Block, fromPeer string) {
 	s.cfg.OnBlock(b, fromPeer)
 }
 
+// HandleBlocks processes a batch block response to a previous GetBlocks request.
+// It clears inflight state for each received block and forwards blocks to the chain via cfg.OnBlock.
+func (s *Syncer) HandleBlocks(blocks []*types.Block, fromPeer string) {
+	if len(blocks) == 0 || s.cfg.OnBlock == nil {
+		return
+	}
+	for _, b := range blocks {
+		if b == nil {
+			continue
+		}
+		h := b.Hash
+		if h.IsZero() {
+			if computed, err := crypto.HashHeaderNonce(b.Header, b.Nonce); err == nil {
+				h = computed
+			}
+		}
+		s.onBlockArrived(h)
+		s.cfg.OnBlock(b, fromPeer)
+	}
+}
+
 // HandleInvTx processes a tx announcement.
 // If we don't have the tx yet, request it from the announcing peer.
 func (s *Syncer) HandleInvTx(txid string, fromPeer string) {
@@ -350,11 +371,25 @@ func (s *Syncer) dispatchQueuedBlocks(now time.Time) {
 		h  types.Hash
 	}
 	sends := make([]sendReq, 0, 8)
+	type sendBatch struct {
+		to     string
+		hashes []types.Hash
+	}
+	batches := make([]sendBatch, 0, 4)
 
 	s.mu.Lock()
+	// 父块优先：单块 GetBlock
 	for len(s.inflightBlocks) < s.cfg.MaxInflightBlocks {
 		h, peerID, kind, ok := s.popNextQueuedLocked()
 		if !ok {
+			break
+		}
+		// 把 popNextQueuedLocked 的优先级保持不变，但我们要在这里对 blkSync 做批量，
+		// 所以如果取到了 blkSync，就先“放回去”并跳出，让后面专门的 sync 批量逻辑处理。
+		if kind == blkSync {
+			// 放回队首（保持顺序）
+			s.queueSync = append([]types.Hash{h}, s.queueSync...)
+			s.queuedSync[h] = peerID
 			break
 		}
 		if s.cfg.Chain.HasBlock(h) {
@@ -377,6 +412,80 @@ func (s *Syncer) dispatchQueuedBlocks(now time.Time) {
 		}
 		sends = append(sends, sendReq{to: peerID, h: h})
 	}
+
+	// 同步块：批量 GetBlocks（每个 hash 仍然占用窗口 1 个单位）
+	syncPeer := s.syncPeer
+	if syncPeer == "" {
+		syncPeer = bestPeer
+	}
+	for len(s.inflightBlocks) < s.cfg.MaxInflightBlocks && len(s.queueSync) > 0 {
+		remaining := s.cfg.MaxInflightBlocks - len(s.inflightBlocks)
+		bs := s.cfg.BlocksBatchSize
+		if bs <= 0 {
+			bs = 1
+		}
+		if bs > remaining {
+			bs = remaining
+		}
+		if bs > len(s.queueSync) {
+			bs = len(s.queueSync)
+		}
+		if bs <= 0 {
+			break
+		}
+		if syncPeer == "" || syncPeer == s.cfg.NodeID {
+			break
+		}
+		hashes := make([]types.Hash, 0, bs)
+		for i := 0; i < bs; i++ {
+			h := s.queueSync[0]
+			s.queueSync = s.queueSync[1:]
+			delete(s.queuedSync, h)
+			if h.IsZero() || s.cfg.Chain.HasBlock(h) {
+				continue
+			}
+			if _, ok := s.inflightBlocks[h]; ok {
+				continue
+			}
+			s.inflightBlocks[h] = &inflightBlockReq{
+				peer:     syncPeer,
+				kind:     blkSync,
+				attempts: 1,
+				deadline: now.Add(s.cfg.SyncTimeout),
+			}
+			hashes = append(hashes, h)
+		}
+		if len(hashes) > 0 {
+			batches = append(batches, sendBatch{to: syncPeer, hashes: hashes})
+		}
+	}
+
+	// inv：单块 GetBlock
+	for len(s.inflightBlocks) < s.cfg.MaxInflightBlocks && len(s.queueInv) > 0 {
+		h := s.queueInv[0]
+		s.queueInv = s.queueInv[1:]
+		peerID := s.queuedInv[h]
+		delete(s.queuedInv, h)
+		if h.IsZero() || s.cfg.Chain.HasBlock(h) {
+			continue
+		}
+		if _, ok := s.inflightBlocks[h]; ok {
+			continue
+		}
+		if peerID == "" {
+			peerID = bestPeer
+		}
+		if peerID == "" || peerID == s.cfg.NodeID {
+			continue
+		}
+		s.inflightBlocks[h] = &inflightBlockReq{
+			peer:     peerID,
+			kind:     blkInv,
+			attempts: 1,
+			deadline: now.Add(s.cfg.SyncTimeout),
+		}
+		sends = append(sends, sendReq{to: peerID, h: h})
+	}
 	s.mu.Unlock()
 
 	for _, r := range sends {
@@ -388,6 +497,10 @@ func (s *Syncer) dispatchQueuedBlocks(now time.Time) {
 			Payload:   types.GetBlockPayload{Hash: r.h},
 		})
 	}
+
+	for _, b := range batches {
+		s.sendGetBlocks(b.to, b.hashes)
+	}
 }
 
 func (s *Syncer) onBlockArrived(h types.Hash) {
@@ -397,6 +510,19 @@ func (s *Syncer) onBlockArrived(h types.Hash) {
 	s.mu.Lock()
 	delete(s.inflightBlocks, h)
 	s.mu.Unlock()
+}
+
+func (s *Syncer) sendGetBlocks(to string, hashes []types.Hash) {
+	if s.cfg.Transport == nil || to == "" || to == s.cfg.NodeID || len(hashes) == 0 {
+		return
+	}
+	s.cfg.Transport.Send(to, types.Message{
+		Type:      types.MsgGetBlocks,
+		From:      s.cfg.NodeID,
+		To:        to,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   types.GetBlocksPayload{Hashes: hashes},
+	})
 }
 
 // Start runs a background loop that:
@@ -707,6 +833,7 @@ func (s *Syncer) tickInflight(now time.Time) {
 		h  types.Hash
 	}
 	sends := make([]sendReq, 0, 8)
+	retrySync := make(map[string][]types.Hash)
 	timeouts := make([]string, 0, 8)
 	syncFailed := false
 
@@ -733,7 +860,11 @@ func (s *Syncer) tickInflight(now time.Time) {
 		req.attempts++
 		req.deadline = now.Add(s.cfg.SyncTimeout)
 		if peerID != "" && peerID != s.cfg.NodeID {
-			sends = append(sends, sendReq{to: peerID, h: h})
+			if req.kind == blkSync {
+				retrySync[peerID] = append(retrySync[peerID], h)
+			} else {
+				sends = append(sends, sendReq{to: peerID, h: h})
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -749,6 +880,22 @@ func (s *Syncer) tickInflight(now time.Time) {
 			Timestamp: time.Now().UnixMilli(),
 			Payload:   types.GetBlockPayload{Hash: r.h},
 		})
+	}
+	for peerID, hashes := range retrySync {
+		if len(hashes) == 0 {
+			continue
+		}
+		bs := s.cfg.BlocksBatchSize
+		if bs <= 0 {
+			bs = 1
+		}
+		for i := 0; i < len(hashes); i += bs {
+			end := i + bs
+			if end > len(hashes) {
+				end = len(hashes)
+			}
+			s.sendGetBlocks(peerID, hashes[i:end])
+		}
 	}
 	if syncFailed {
 		s.enterBackoff(now)
