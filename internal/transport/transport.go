@@ -23,7 +23,7 @@ type Transport interface {
 	// Send 用于 Get*/* 的按需拉取（定向请求/响应）。
 	Send(to string, msg types.Message)
 
-	// 故障注入（inproc 模拟网络用）。
+	// SetDelay 故障注入（inproc 模拟网络用）。
 	SetDelay(d time.Duration)
 	SetDropRate(p float64)
 }

@@ -1,3 +1,8 @@
+// Package network 提供“单进程内存网络”的模拟能力（发布/订阅总线）。
+//
+// 说明：
+// - 仅用于本项目的 inproc 模式（单进程多节点模拟）。
+// - 可注入延迟与丢包，用于观察同步/收敛行为。
 package network
 
 import (
@@ -8,9 +13,10 @@ import (
 	"simchain-go/internal/types"
 )
 
+// Handler 是节点注册到 NetworkBus 的回调函数。
 type Handler func(msg types.Message)
 
-// NetworkBus is an in-memory pub/sub bus simulating a network.
+// NetworkBus 是内存中的 pub/sub 总线，用于模拟“网络投递”。
 //
 // 约定（V2）：
 // - Broadcast：用于“inv 公告”类的扇出广播（告诉别人“我有 tx/block 的摘要”）。

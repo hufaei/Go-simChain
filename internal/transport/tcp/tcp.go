@@ -22,25 +22,40 @@ import (
 )
 
 type Config struct {
+	// ListenAddr 是本地监听地址（V3-B 仅支持 127.0.0.1/localhost）。
 	ListenAddr string
-	Seeds      []string
+	// Seeds 是可选的 seed 列表（用于初始发现 peers）。
+	Seeds []string
 
+	// Magic/Version 用于避免“串网”，握手时必须一致。
 	Magic   string
 	Version int
 
+	// Identity 用于握手签名与 nodeID 推导（最小身份绑定）。
 	Identity *identity.Identity
 
-	MaxPeers       int
-	OutboundPeers  int
+	// MaxPeers 是最大连接数（总入站+出站）。
+	MaxPeers int
+	// OutboundPeers 是目标出站连接数。
+	OutboundPeers int
+	// MaxMessageSize 是单条消息最大字节数（用于 framing 限制）。
 	MaxMessageSize int
 
+	// ReadTimeout/WriteTimeout 是单次读写的超时上限。
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
-	IdleTimeout  time.Duration
+	// IdleTimeout 是空闲读超时（用于防止连接被慢速占用）。
+	IdleTimeout time.Duration
 
+	// PeerRequestInterval 是向 peers 请求地址列表的周期。
 	PeerRequestInterval time.Duration
 }
 
+// Transport 是 V3-B 的 TCP 传输实现：
+// - 仅支持本机回环（loopback）
+// - 使用 length-prefix framing 处理粘包/拆包
+// - 握手阶段做最小身份绑定（ed25519 challenge-response）
+// - 提供简单的 seed 发现（GetPeers/Peers）
 type Transport struct {
 	cfg Config
 
@@ -223,6 +238,7 @@ func (t *Transport) Send(to string, msg types.Message) {
 	p.sendRaw(raw)
 }
 
+// SetDelay / SetDropRate 用于 inproc 的故障注入；tcp 模式下暂不支持（no-op）。
 func (t *Transport) SetDelay(d time.Duration) {}
 func (t *Transport) SetDropRate(p float64)    {}
 
@@ -741,7 +757,7 @@ func bytesEq(a, b []byte) bool {
 }
 
 func encodeFrame(msg types.Message, max int) ([]byte, error) {
-	raw, err := jsonMarshal(msg)
+	raw, err := json.Marshal(msg)
 	if err != nil {
 		return nil, err
 	}
@@ -783,19 +799,10 @@ func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, erro
 		return types.Message{}, err
 	}
 	var msg types.Message
-	if err := jsonUnmarshal(buf, &msg); err != nil {
+	if err := json.Unmarshal(buf, &msg); err != nil {
 		return types.Message{}, err
 	}
 	return msg, nil
-}
-
-func jsonMarshal(v any) ([]byte, error) {
-	// keep centralized to allow future swap.
-	return json.Marshal(v)
-}
-
-func jsonUnmarshal(b []byte, v any) error {
-	return json.Unmarshal(b, v)
 }
 
 func (t *Transport) markDialInFlight(addr string) bool {

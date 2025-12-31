@@ -5,16 +5,11 @@ import (
 	"fmt"
 )
 
-// MessageType represents the logical protocol type.
+// MessageType 表示节点之间的逻辑消息类型（协议类型）。
 type MessageType string
 
 const (
-	MsgNewTx       MessageType = "NewTx"
-	MsgNewBlock    MessageType = "NewBlock"
-	MsgRequestTip  MessageType = "RequestTip"
-	MsgResponseTip MessageType = "ResponseTip"
-
-	// V3-B: transport-level control (tcp + discovery + identity).
+	// V3-B：传输层控制消息（tcp + 发现 + 身份绑定）。
 	MsgHello    MessageType = "Hello"
 	MsgHelloAck MessageType = "HelloAck"
 	MsgAuth     MessageType = "Auth"
@@ -45,15 +40,19 @@ const (
 	MsgBlocks     MessageType = "Blocks"
 )
 
-// Message is a generic node-to-node message.
-// Payload uses concrete structs below.
+// Message 是节点之间通用的消息封装。
+// Payload 使用本文件里定义的具体 payload 结构体。
+//
+// 说明（V3-B）：
+//   - inproc：Payload 直接携带具体结构体（便于类型断言）。
+//   - tcp：消息经过 JSON 编解码；这里通过自定义 Marshal/Unmarshal，按 Type 把 payload 解回具体结构体，
+//     避免退化成 map[string]any。
 type Message struct {
 	Type      MessageType `json:"type"`
 	From      string      `json:"from"`
 	To        string      `json:"to,omitempty"`
 	Timestamp int64       `json:"timestamp"`
-	// TraceID correlates a single request/response round trip.
-	// 本仓库把它当作轻量的“RPC”相关 ID，用于 initial sync 的一次请求-一次响应匹配。
+	// TraceID 用于“一次请求-一次响应”的轻量 RPC 匹配（主要给同步流程使用）。
 	TraceID string `json:"traceId,omitempty"`
 	Payload any    `json:"payload"`
 }
@@ -67,7 +66,12 @@ type wireMessage struct {
 	Payload   json.RawMessage `json:"payload"`
 }
 
-func (m Message) MarshalJSON() ([]byte, error) {
+// MarshalJSON 必须使用指针接收器（*Message），以避免同一个类型上出现“值接收器 + 指针接收器”的混用；
+// 同时也要求调用方在跨进程编码时使用 `json.Marshal(&msg)`（本仓库的 tcp framing 已统一处理）。
+func (m *Message) MarshalJSON() ([]byte, error) {
+	if m == nil {
+		return []byte("null"), nil
+	}
 	var payload json.RawMessage
 	switch p := m.Payload.(type) {
 	case nil:
@@ -92,6 +96,8 @@ func (m Message) MarshalJSON() ([]byte, error) {
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {
+	// 注意：UnmarshalJSON 必须使用指针接收器（*Message），才能把解析结果写回 m，
+	// 这是 encoding/json 的常见用法。
 	var w wireMessage
 	if err := json.Unmarshal(b, &w); err != nil {
 		return err
@@ -102,115 +108,123 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	m.Timestamp = w.Timestamp
 	m.TraceID = w.TraceID
 
-	var payload any
-	switch w.Type {
-	case MsgHello:
-		payload = &HelloPayload{}
-	case MsgHelloAck:
-		payload = &HelloAckPayload{}
-	case MsgAuth:
-		payload = &AuthPayload{}
-	case MsgGetPeers:
-		payload = &GetPeersPayload{}
-	case MsgPeers:
-		payload = &PeersPayload{}
-	case MsgInvTx:
-		payload = &InvTxPayload{}
-	case MsgGetTx:
-		payload = &GetTxPayload{}
-	case MsgTx:
-		payload = &TxPayload{}
-	case MsgInvBlock:
-		payload = &InvBlockPayload{}
-	case MsgGetBlock:
-		payload = &GetBlockPayload{}
-	case MsgBlock:
-		payload = &BlockPayload{}
-	case MsgGetTip:
-		payload = &GetTipPayload{}
-	case MsgTip:
-		payload = &TipPayload{}
-	case MsgGetHeaders:
-		payload = &GetHeadersPayload{}
-	case MsgHeaders:
-		payload = &HeadersPayload{}
-	case MsgGetBlocks:
-		payload = &GetBlocksPayload{}
-	case MsgBlocks:
-		payload = &BlocksPayload{}
-	default:
-		// Preserve unknown payload as raw JSON to keep decoding forward-compatible.
-		m.Payload = json.RawMessage(w.Payload)
+	if w.Payload == nil {
+		m.Payload = nil
 		return nil
 	}
 
-	if err := json.Unmarshal(w.Payload, payload); err != nil {
-		return fmt.Errorf("decode payload for %q: %w", w.Type, err)
-	}
-
-	// Store as value where possible, to preserve existing inproc type-assert patterns.
-	switch p := payload.(type) {
-	case *HelloPayload:
-		m.Payload = *p
-	case *HelloAckPayload:
-		m.Payload = *p
-	case *AuthPayload:
-		m.Payload = *p
-	case *GetPeersPayload:
-		m.Payload = *p
-	case *PeersPayload:
-		m.Payload = *p
-	case *InvTxPayload:
-		m.Payload = *p
-	case *GetTxPayload:
-		m.Payload = *p
-	case *TxPayload:
-		m.Payload = *p
-	case *InvBlockPayload:
-		m.Payload = *p
-	case *GetBlockPayload:
-		m.Payload = *p
-	case *BlockPayload:
-		m.Payload = *p
-	case *GetTipPayload:
-		m.Payload = *p
-	case *TipPayload:
-		m.Payload = *p
-	case *GetHeadersPayload:
-		m.Payload = *p
-	case *HeadersPayload:
-		m.Payload = *p
-	case *GetBlocksPayload:
-		m.Payload = *p
-	case *BlocksPayload:
-		m.Payload = *p
+	switch w.Type {
+	case MsgHello:
+		var pl HelloPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgHelloAck:
+		var pl HelloAckPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgAuth:
+		var pl AuthPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetPeers:
+		var pl GetPeersPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgPeers:
+		var pl PeersPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgInvTx:
+		var pl InvTxPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetTx:
+		var pl GetTxPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgTx:
+		var pl TxPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgInvBlock:
+		var pl InvBlockPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetBlock:
+		var pl GetBlockPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgBlock:
+		var pl BlockPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetTip:
+		var pl GetTipPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgTip:
+		var pl TipPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetHeaders:
+		var pl GetHeadersPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgHeaders:
+		var pl HeadersPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgGetBlocks:
+		var pl GetBlocksPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
+	case MsgBlocks:
+		var pl BlocksPayload
+		if err := json.Unmarshal(w.Payload, &pl); err != nil {
+			return fmt.Errorf("decode payload for %q: %w", w.Type, err)
+		}
+		m.Payload = pl
 	default:
-		m.Payload = payload
+		// 未知消息：保留原始 JSON，便于向前兼容。
+		m.Payload = w.Payload
+		return nil
 	}
 	return nil
 }
 
-type NewTxPayload struct {
-	Tx Transaction `json:"tx"`
-}
-
-type NewBlockPayload struct {
-	Block *Block `json:"block"`
-}
-
-type RequestTipPayload struct {
-	KnownTipHash string `json:"knownTipHash,omitempty"`
-	KnownHeight  uint64 `json:"knownHeight,omitempty"`
-}
-
-type ResponseTipPayload struct {
-	TipHash   string  `json:"tipHash"`
-	TipHeight uint64  `json:"tipHeight"`
-	CumWork   string  `json:"cumWork"`
-	Blocks    []Block `json:"blocks,omitempty"`
-}
-
-// HelloPayload starts a TCP handshake (V3-B).
+// HelloPayload：TCP 握手第一步（发起方 -> 响应方）。
 type HelloPayload struct {
 	Magic      string `json:"magic"`
 	Version    int    `json:"version"`
@@ -220,8 +234,12 @@ type HelloPayload struct {
 	Timestamp  int64  `json:"timestamp"` // unix ms
 }
 
-// HelloAckPayload authenticates the responder by signing the initiator nonce,
-// and provides a responder nonce for the initiator to sign back in Auth.
+// HelloAckPayload：TCP 握手第二步（响应方 -> 发起方）。
+//
+// 响应方需要：
+// - 回显发起方 nonce（EchoNonce）
+// - 用自己的私钥签名该 nonce（SigOverEcho）
+// - 生成一个新的 nonce，让发起方在 Auth 中签回（Nonce）
 type HelloAckPayload struct {
 	Magic       string `json:"magic"`
 	Version     int    `json:"version"`
@@ -233,7 +251,7 @@ type HelloAckPayload struct {
 	Timestamp   int64  `json:"timestamp"` // unix ms
 }
 
-// AuthPayload completes the handshake by signing the responder nonce.
+// AuthPayload：TCP 握手第三步（发起方 -> 响应方），签回响应方 nonce。
 type AuthPayload struct {
 	EchoNonce []byte `json:"echoNonce"`
 	Sig       []byte `json:"sig"`

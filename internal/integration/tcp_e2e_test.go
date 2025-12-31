@@ -20,14 +20,14 @@ import (
 )
 
 func TestTCPE2E_TxPropagation_LateJoin_Restart(t *testing.T) {
-	// This test intentionally uses real TCP sockets on loopback to validate:
-	// - framing + JSON message decoding
-	// - handshake identity binding
-	// - seed discovery (GetPeers/Peers)
-	// - inv/get propagation for tx and blocks
-	// - store-based restart recovery
+	// 这是一个“端到端”集成测试：使用真实的 TCP loopback 连接验证 V3-B 的关键闭环：
+	// - framing + JSON 消息解码
+	// - 握手身份绑定（ed25519）
+	// - seed 发现（GetPeers/Peers）
+	// - tx/block 的 inv/get 传播
+	// - 基于 Store 的重启恢复
 	//
-	// It does not attempt to validate reorg behavior deterministically.
+	// 注：不尝试确定性验证 reorg（需要更复杂的可控网络/调度）。
 
 	oldOut := log.Writer()
 	log.SetOutput(io.Discard)
@@ -75,7 +75,8 @@ func TestTCPE2E_TxPropagation_LateJoin_Restart(t *testing.T) {
 			t.Fatalf("identity: %v", err)
 		}
 
-		diff := uint32(6) // fast for tests (expected ~64 hashes per block)
+		// 测试用低难度，加快出块速度（期望 ~64 次 hash/块）。
+		diff := uint32(6)
 		st, err := store.Open(dataDir, diff, genesis)
 		if err != nil {
 			t.Fatalf("store open: %v", err)
@@ -217,7 +218,9 @@ func mustFreePort(t *testing.T) string {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	_ = ln.Close()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		t.Fatalf("split addr: %v", err)

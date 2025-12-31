@@ -1,3 +1,4 @@
+// Package inproc 提供 Transport 的单进程实现：通过内存总线投递消息。
 package inproc
 
 import (
@@ -8,18 +9,16 @@ import (
 	"simchain-go/internal/types"
 )
 
-// InprocTransport adapts NetworkBus to the Transport interface.
-// It keeps the current single-process simulation model.
+// InprocTransport 把内存网络（NetworkBus）适配成 Transport 接口。
+//
+// 说明：
+// - 它只用于“单进程多节点”的模拟模式，方便注入延迟/丢包并做调试观察。
 type InprocTransport struct {
 	bus *network.NetworkBus
 }
 
 func New(seed int64) *InprocTransport {
 	return &InprocTransport{bus: network.NewNetworkBus(seed)}
-}
-
-func FromBus(bus *network.NetworkBus) *InprocTransport {
-	return &InprocTransport{bus: bus}
 }
 
 func (t *InprocTransport) Register(nodeID string, handler transport.Handler) {

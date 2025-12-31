@@ -12,7 +12,7 @@ func TestMessageJSONRoundTripDecodesConcretePayload(t *testing.T) {
 		Timestamp: 123,
 		Payload:   InvTxPayload{TxID: "tx-1"},
 	}
-	raw, err := json.Marshal(orig)
+	raw, err := json.Marshal(&orig)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -40,7 +40,7 @@ func TestMessageJSONUnknownTypePreservesPayloadAsRaw(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if decoded.Type != MessageType("UnknownType") {
+	if decoded.Type != ("UnknownType") {
 		t.Fatalf("type mismatch: %q", decoded.Type)
 	}
 	if _, ok := decoded.Payload.(json.RawMessage); !ok {

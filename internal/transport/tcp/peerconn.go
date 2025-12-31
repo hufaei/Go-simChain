@@ -10,13 +10,16 @@ import (
 )
 
 type peerConn struct {
+	// id 是对端的 nodeID（由 pubkey 推导，握手成功后才可信）。
 	id         string
 	listenAddr string
 	pubKey     ed25519.PublicKey
-	outbound   bool
+	// outbound 表示是否由本节点主动拨号建立（用于做出站连接数限制）。
+	outbound bool
 
 	conn net.Conn
 
+	// writeCh 是有界写队列：保证同一个 net.Conn 只由一个写协程串行写入，避免并发写冲突。
 	writeTimeout time.Duration
 	writeCh      chan []byte
 
@@ -53,7 +56,7 @@ func (p *peerConn) sendRaw(frame []byte) {
 	select {
 	case p.writeCh <- frame:
 	default:
-		// Drop if the peer is too slow.
+		// 对端过慢时丢弃，避免无限堆积导致内存膨胀。
 	}
 }
 
