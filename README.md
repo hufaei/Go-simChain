@@ -59,3 +59,8 @@ go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:
 ```powershell
 go test ./...
 ```
+
+也可以只跑 V3-B 的 TCP 集成测试：
+```powershell
+go test ./internal/integration -run TestTCPE2E -count=1
+```

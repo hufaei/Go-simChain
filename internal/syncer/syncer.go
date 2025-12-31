@@ -555,6 +555,8 @@ func (s *Syncer) Stop() {
 	}
 	ch := s.stopCh
 	done := s.doneCh
+	// Make Stop idempotent: mark not started before closing stopCh to avoid double-close panics.
+	s.started = false
 	s.startMu.Unlock()
 
 	close(ch)

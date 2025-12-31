@@ -1,3 +1,4 @@
 data/
 go_build_*.exe
 .idea/
+qodana.yaml
