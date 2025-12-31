@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,14 +16,24 @@ import (
 	"time"
 
 	"simchain-go/internal/blockchain"
+	"simchain-go/internal/identity"
 	"simchain-go/internal/mempool"
 	"simchain-go/internal/node"
 	"simchain-go/internal/store"
 	"simchain-go/internal/transport/inproc"
+	"simchain-go/internal/transport/tcp"
 	"simchain-go/internal/types"
 )
 
 func main() {
+	transportFlag := flag.String("transport", "inproc", "transport: inproc|tcp")
+	listenFlag := flag.String("listen", "", "tcp listen addr, e.g. 127.0.0.1:7000 (required for --transport=tcp)")
+	seedsFlag := flag.String("seeds", "", "comma-separated seed addrs for tcp mode, e.g. 127.0.0.1:7000,127.0.0.1:7001")
+	dataDirFlag := flag.String("data-dir", "", "data dir for this node (tcp mode). If empty, defaults to data/tcp-<port>")
+	idFlag := flag.String("id", "", "node id override (tcp mode). If set, must match the derived id from the node key")
+	maxPeersFlag := flag.Int("max-peers", 8, "max connected peers (tcp mode)")
+	outboundPeersFlag := flag.Int("outbound-peers", 4, "target number of outbound peers (tcp mode)")
+
 	nodesFlag := flag.Int("nodes", 2, "number of nodes to simulate")
 	difficultyFlag := flag.Uint("difficulty", 16, "PoW difficulty in leading zero bits")
 	durationFlag := flag.Duration("duration", 30*time.Second, "simulation duration")
@@ -39,13 +52,27 @@ func main() {
 	debugBlockTxMaxFlag := flag.Int("debug-block-tx-max", 20, "how many txids to print per main-chain block when dumping (0 disables tx listing)")
 	flag.Parse()
 
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	diff := uint32(*difficultyFlag)
+	genesis := types.NewGenesisBlock()
+
+	switch strings.ToLower(strings.TrimSpace(*transportFlag)) {
+	case "tcp":
+		if err := runTCP(*listenFlag, *seedsFlag, *dataDirFlag, *idFlag, *maxPeersFlag, *outboundPeersFlag, diff, *durationFlag, *txIntervalFlag, *maxTxPerBlockFlag, *minerSleepFlag, *seedFlag, *debugDumpOnTipFlag, *debugChainDepthFlag, *debugMempoolMaxFlag, *debugBlockTxMaxFlag, genesis); err != nil {
+			log.Fatal(err)
+		}
+		return
+	case "inproc", "":
+		// continue below
+	default:
+		log.Fatalf("unknown transport: %s", *transportFlag)
+	}
+
 	if *nodesFlag < 1 {
 		log.Fatal("nodes must be >= 1")
 	}
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	genesis := types.NewGenesisBlock()
 	tr := inproc.New(*seedFlag)
 	if *netDelayFlag > 0 {
 		tr.SetDelay(*netDelayFlag)
@@ -53,8 +80,6 @@ func main() {
 	if *dropRateFlag > 0 {
 		tr.SetDropRate(*dropRateFlag)
 	}
-
-	diff := uint32(*difficultyFlag)
 
 	bootstrap := *bootstrapNodesFlag
 	if bootstrap <= 0 || bootstrap > *nodesFlag {
@@ -324,4 +349,231 @@ loop:
 
 func jsonMarshalIndent(v any) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
+}
+
+func runTCP(
+	listenAddr string,
+	seeds string,
+	dataDir string,
+	expectedID string,
+	maxPeers int,
+	outboundPeers int,
+	difficulty uint32,
+	duration time.Duration,
+	txInterval time.Duration,
+	maxTxPerBlock int,
+	minerSleep time.Duration,
+	randSeed int64,
+	debugDumpOnTip bool,
+	debugChainDepth int,
+	debugMempoolMax int,
+	debugBlockTxMax int,
+	genesis *types.Block,
+) error {
+	if listenAddr == "" {
+		return fmt.Errorf("--listen is required for --transport=tcp")
+	}
+	if !isLoopbackListenAddr(listenAddr) {
+		return fmt.Errorf("tcp mode only supports loopback listen addr, got %q", listenAddr)
+	}
+	if dataDir == "" {
+		_, port, err := net.SplitHostPort(listenAddr)
+		if err != nil {
+			return err
+		}
+		dataDir = filepath.Join("data", "tcp-"+port)
+	}
+
+	id, err := identity.LoadOrCreate(dataDir)
+	if err != nil {
+		return fmt.Errorf("load identity: %w", err)
+	}
+	if expectedID != "" && expectedID != id.NodeID {
+		return fmt.Errorf("--id mismatch: got %q want %q", expectedID, id.NodeID)
+	}
+	nodeID := id.NodeID
+
+	st, err := store.Open(dataDir, difficulty, genesis)
+	if err != nil {
+		return fmt.Errorf("init store: %w", err)
+	}
+	blocks, err := st.LoadMainChain()
+	if err != nil {
+		return fmt.Errorf("load chain: %w", err)
+	}
+	if len(blocks) == 0 {
+		return fmt.Errorf("load chain: empty")
+	}
+
+	chain, err := blockchain.NewBlockchain(blocks[0], difficulty)
+	if err != nil {
+		return fmt.Errorf("init chain: %w", err)
+	}
+	for _, b := range blocks[1:] {
+		if _, err := chain.AddBlock(b); err != nil {
+			return fmt.Errorf("restore chain: %w", err)
+		}
+	}
+
+	seedList := splitCSV(seeds)
+	tr, err := tcp.New(tcp.Config{
+		ListenAddr:     listenAddr,
+		Seeds:          seedList,
+		Magic:          "simchain-go",
+		Version:        1,
+		Identity:       id,
+		MaxPeers:       maxPeers,
+		OutboundPeers:  outboundPeers,
+		MaxMessageSize: 2 << 20,
+	})
+	if err != nil {
+		return fmt.Errorf("init tcp transport: %w", err)
+	}
+	if err := tr.Start(); err != nil {
+		return fmt.Errorf("start tcp transport: %w", err)
+	}
+	defer tr.Stop()
+
+	shortHash := func(h types.Hash) string {
+		s := h.String()
+		if len(s) <= 12 {
+			return s
+		}
+		return s[:12]
+	}
+	logBlock := func(title string, lines []string) {
+		var b strings.Builder
+		b.WriteString(title)
+		for _, line := range lines {
+			b.WriteString("\n")
+			b.WriteString(line)
+		}
+		log.Print(b.String())
+	}
+	debugStatePrettyLines := func(st node.DebugState) []string {
+		lines := make([]string, 0, 3+len(st.MainChain))
+		lines = append(lines, fmt.Sprintf("  node=%s tipHeight=%d tip=%s", st.NodeID, st.TipHeight, shortHash(st.TipHash)))
+		if debugMempoolMax == 0 {
+			lines = append(lines, fmt.Sprintf("  mempool size=%d", st.MempoolSize))
+		} else {
+			lines = append(lines, fmt.Sprintf("  mempool size=%d txids=[%s]", st.MempoolSize, strings.Join(st.MempoolTxIDs, ", ")))
+		}
+		if debugChainDepth != 0 {
+			lines = append(lines, "  mainchain:")
+			for _, b := range st.MainChain {
+				txSuffix := ""
+				if debugBlockTxMax != 0 && len(b.TxIDs) > 0 {
+					txSuffix = " txids=[" + strings.Join(b.TxIDs, ", ") + "]"
+				}
+				lines = append(lines, fmt.Sprintf("    - h=%d hash=%s txs=%d%s", b.Height, shortHash(b.Hash), b.TxCount, txSuffix))
+			}
+		}
+		return lines
+	}
+
+	mp := mempool.NewMempool()
+	var n *node.Node
+	n = node.NewNode(
+		nodeID,
+		chain,
+		mp,
+		tr,
+		node.Config{
+			Difficulty:    difficulty,
+			MaxTxPerBlock: maxTxPerBlock,
+			MinerSleep:    minerSleep,
+			OnTipChange: func(ev node.TipChangeEvent) {
+				if err := st.ApplyTipChange(chain, ev.TipHash, ev.Reorg); err != nil {
+					log.Printf("STORE_ERR node=%s err=%v", nodeID, err)
+				}
+				if debugDumpOnTip {
+					lines := []string{
+						fmt.Sprintf("trigger node=%s from=%s height=%d tip=%s reorg=%t", ev.NodeID, ev.FromPeer, ev.Height, shortHash(ev.TipHash), ev.Reorg != nil),
+					}
+					if n != nil {
+						lines = append(lines, debugStatePrettyLines(n.DebugState(debugChainDepth, debugMempoolMax, debugBlockTxMax))...)
+					}
+					logBlock("STATE_DUMP", lines)
+				}
+			},
+		},
+	)
+	n.StartSync()
+	n.StartMining()
+	defer n.StopSync()
+	defer n.StopMining()
+
+	log.Printf("TCP_NODE_START id=%s listen=%s seeds=%s difficulty=%d txInterval=%s", nodeID, listenAddr, strings.Join(seedList, ","), difficulty, txInterval.String())
+
+	rng := rand.New(rand.NewSource(randSeed))
+	var txTicker *time.Ticker
+	if txInterval > 0 {
+		txTicker = time.NewTicker(txInterval)
+		defer txTicker.Stop()
+	}
+
+	var endTimer *time.Timer
+	if duration > 0 {
+		endTimer = time.NewTimer(duration)
+		defer endTimer.Stop()
+	}
+
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
+	defer signal.Stop(interrupt)
+
+	txCount := 0
+	for {
+		select {
+		case <-interrupt:
+			log.Printf("TCP_NODE_STOP reason=interrupt txs=%d", txCount)
+			return nil
+		case <-func() <-chan time.Time {
+			if endTimer == nil {
+				return nil
+			}
+			return endTimer.C
+		}():
+			log.Printf("TCP_NODE_STOP reason=duration txs=%d", txCount)
+			return nil
+		case <-func() <-chan time.Time {
+			if txTicker == nil {
+				return nil
+			}
+			return txTicker.C
+		}():
+			payload := fmt.Sprintf("tx-%d rnd=%d", txCount+1, rng.Int63())
+			n.SubmitTransaction(payload)
+			txCount++
+		}
+	}
+}
+
+func splitCSV(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

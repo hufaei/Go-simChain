@@ -14,6 +14,8 @@
   - V2 说明书：`Inv*` 公告 + `Get*/*` 按需拉取（避免广播整块/整交易）、headers-first、late join。
 - `DESIGN_V3.md`
   - V3-A 设计：引入 `Transport/Syncer/Store` 的架构拆分与主链持久化（默认目录 `data/<nodeID>/...`）。
+- `DESIGN_V3B.md`
+  - V3-B 版本文件：多进程 TCP 网络 + seed 自动发现 + 最小身份绑定（ed25519）。
 - `go.mod`
   - Go module 定义：模块名 `simchain-go`。
 
