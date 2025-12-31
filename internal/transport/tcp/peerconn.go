@@ -13,6 +13,7 @@ type peerConn struct {
 	id         string
 	listenAddr string
 	pubKey     ed25519.PublicKey
+	outbound   bool
 
 	conn net.Conn
 
@@ -23,11 +24,12 @@ type peerConn struct {
 	closedCh  chan struct{}
 }
 
-func newPeerConn(id string, listenAddr string, pub ed25519.PublicKey, conn net.Conn, writeTimeout time.Duration) *peerConn {
+func newPeerConn(id string, listenAddr string, pub ed25519.PublicKey, conn net.Conn, outbound bool, writeTimeout time.Duration) *peerConn {
 	pc := &peerConn{
 		id:           id,
 		listenAddr:   listenAddr,
 		pubKey:       pub,
+		outbound:     outbound,
 		conn:         conn,
 		writeTimeout: writeTimeout,
 		writeCh:      make(chan []byte, 128),

@@ -429,10 +429,6 @@ func runTCP(
 	if err != nil {
 		return fmt.Errorf("init tcp transport: %w", err)
 	}
-	if err := tr.Start(); err != nil {
-		return fmt.Errorf("start tcp transport: %w", err)
-	}
-	defer tr.Stop()
 
 	shortHash := func(h types.Hash) string {
 		s := h.String()
@@ -498,6 +494,14 @@ func runTCP(
 			},
 		},
 	)
+
+	// Important ordering: register the node handler before starting the transport, so early TCP
+	// traffic isn't silently dropped due to a nil handler.
+	if err := tr.Start(); err != nil {
+		return fmt.Errorf("start tcp transport: %w", err)
+	}
+	defer tr.Stop()
+
 	n.StartSync()
 	n.StartMining()
 	defer n.StopSync()

@@ -8,8 +8,10 @@ import (
 	"errors"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,15 +50,27 @@ type Transport struct {
 
 	ln net.Listener
 
-	peers    map[string]*peerConn
+	peers map[string]*peerConn
+
+	dialMu       sync.Mutex
+	dialInFlight map[string]struct{}
+
 	addrMu   sync.Mutex
-	addrBook map[string]time.Time
+	addrBook map[string]addrInfo
+
+	rngMu sync.Mutex
+	rng   *mrand.Rand
 
 	stopCh chan struct{}
 	doneCh chan struct{}
 
 	startOnce sync.Once
 	stopOnce  sync.Once
+}
+
+type addrInfo struct {
+	lastSeen time.Time
+	nextDial time.Time
 }
 
 func New(cfg Config) (*Transport, error) {
@@ -94,12 +108,14 @@ func New(cfg Config) (*Transport, error) {
 		cfg.PeerRequestInterval = 4 * time.Second
 	}
 	return &Transport{
-		cfg:      cfg,
-		localID:  cfg.Identity.NodeID,
-		peers:    make(map[string]*peerConn),
-		addrBook: make(map[string]time.Time),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		cfg:          cfg,
+		localID:      cfg.Identity.NodeID,
+		peers:        make(map[string]*peerConn),
+		dialInFlight: make(map[string]struct{}),
+		addrBook:     make(map[string]addrInfo),
+		rng:          mrand.New(mrand.NewSource(time.Now().UnixNano())),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}, nil
 }
 
@@ -265,7 +281,7 @@ func (t *Transport) handleInbound(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, t.cfg.WriteTimeout)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, false, t.cfg.WriteTimeout)
 	if !t.addPeer(pc) {
 		pc.close()
 		return
@@ -276,23 +292,28 @@ func (t *Transport) handleInbound(conn net.Conn) {
 }
 
 func (t *Transport) handleOutbound(addr string) {
+	defer t.clearDialInFlight(addr)
 	d := net.Dialer{Timeout: t.cfg.ReadTimeout}
 	conn, err := d.Dial("tcp", addr)
 	if err != nil {
+		t.backoffAddrDial(addr, false)
 		return
 	}
 	if !isLoopbackConn(conn) {
 		_ = conn.Close()
+		t.backoffAddrDial(addr, true)
 		return
 	}
 	peerID, peerListen, peerPub, err := t.handshakeOutbound(conn)
 	if err != nil {
 		_ = conn.Close()
+		t.backoffAddrDial(addr, false)
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, t.cfg.WriteTimeout)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, true, t.cfg.WriteTimeout)
 	if !t.addPeer(pc) {
 		pc.close()
+		t.backoffAddrDial(addr, true)
 		return
 	}
 	t.observeAddr(peerListen)
@@ -318,6 +339,14 @@ func (t *Transport) addPeer(pc *peerConn) bool {
 		return false
 	}
 	if _, ok := t.peers[pc.id]; ok {
+		return false
+	}
+	maxOut := t.maxOutboundLocked()
+	if pc.outbound && t.outboundCountLocked() >= maxOut {
+		return false
+	}
+	maxIn := t.cfg.MaxPeers - maxOut
+	if !pc.outbound && maxIn >= 0 && t.inboundCountLocked() >= maxIn {
 		return false
 	}
 	t.peers[pc.id] = pc
@@ -364,8 +393,13 @@ func (t *Transport) observeAddr(addr string) {
 	if !isLoopbackAddr(addr) {
 		return
 	}
+	if !validTCPAddr(addr) {
+		return
+	}
 	t.addrMu.Lock()
-	t.addrBook[addr] = time.Now()
+	info := t.addrBook[addr]
+	info.lastSeen = time.Now()
+	t.addrBook[addr] = info
 	t.addrMu.Unlock()
 }
 
@@ -376,15 +410,24 @@ func (t *Transport) addSeedAddrs(addrs []string) {
 }
 
 func (t *Transport) maybeDialMore() {
-	if t.outboundCount() >= t.cfg.OutboundPeers {
+	targetOut := t.maxOutbound()
+	if t.outboundCount() >= targetOut {
 		return
 	}
 	candidates := t.addrCandidates()
 	for _, addr := range candidates {
-		if t.outboundCount() >= t.cfg.OutboundPeers {
+		if t.outboundCount() >= targetOut {
 			return
 		}
+		if !t.markDialInFlight(addr) {
+			continue
+		}
 		if t.isConnectedToAddr(addr) {
+			t.clearDialInFlight(addr)
+			continue
+		}
+		if !t.addrDialAllowed(addr) {
+			t.clearDialInFlight(addr)
 			continue
 		}
 		go t.handleOutbound(addr)
@@ -394,24 +437,74 @@ func (t *Transport) maybeDialMore() {
 }
 
 func (t *Transport) outboundCount() int {
-	// We don't track inbound/outbound separately; approximate via total peers.
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return len(t.peers)
+	return t.outboundCountLocked()
+}
+
+func (t *Transport) outboundCountLocked() int {
+	n := 0
+	for _, p := range t.peers {
+		if p != nil && p.outbound {
+			n++
+		}
+	}
+	return n
+}
+
+func (t *Transport) inboundCountLocked() int {
+	n := 0
+	for _, p := range t.peers {
+		if p != nil && !p.outbound {
+			n++
+		}
+	}
+	return n
+}
+
+func (t *Transport) maxOutbound() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.maxOutboundLocked()
+}
+
+func (t *Transport) maxOutboundLocked() int {
+	maxOut := t.cfg.OutboundPeers
+	if maxOut < 0 {
+		maxOut = 0
+	}
+	if maxOut > t.cfg.MaxPeers {
+		maxOut = t.cfg.MaxPeers
+	}
+	return maxOut
 }
 
 func (t *Transport) addrCandidates() []string {
 	t.addrMu.Lock()
 	defer t.addrMu.Unlock()
+	now := time.Now()
 	out := make([]string, 0, len(t.addrBook))
-	for a := range t.addrBook {
+	for a, info := range t.addrBook {
 		if a == t.cfg.ListenAddr {
+			continue
+		}
+		if !info.nextDial.IsZero() && info.nextDial.After(now) {
+			continue
+		}
+		if !info.lastSeen.IsZero() && now.Sub(info.lastSeen) > 10*time.Minute {
+			delete(t.addrBook, a)
 			continue
 		}
 		out = append(out, a)
 	}
-	sort.Strings(out)
+	t.shuffleLocked(out)
 	return out
+}
+
+func (t *Transport) shuffleLocked(ss []string) {
+	t.rngMu.Lock()
+	defer t.rngMu.Unlock()
+	t.rng.Shuffle(len(ss), func(i, j int) { ss[i], ss[j] = ss[j], ss[i] })
 }
 
 func (t *Transport) isConnectedToAddr(addr string) bool {
@@ -430,7 +523,7 @@ func (t *Transport) requestPeersFromSomePeer() {
 	if len(ids) == 0 {
 		return
 	}
-	peerID := ids[time.Now().UnixNano()%int64(len(ids))]
+	peerID := ids[t.randIntn(len(ids))]
 	t.Send(peerID, types.Message{
 		Type:      types.MsgGetPeers,
 		From:      t.localID,
@@ -438,6 +531,15 @@ func (t *Transport) requestPeersFromSomePeer() {
 		Timestamp: time.Now().UnixMilli(),
 		Payload:   types.GetPeersPayload{Max: 32},
 	})
+}
+
+func (t *Transport) randIntn(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	t.rngMu.Lock()
+	defer t.rngMu.Unlock()
+	return t.rng.Intn(n)
 }
 
 func (t *Transport) ensureLoopbackListenAddr() error {
@@ -617,6 +719,15 @@ func isLoopbackAddr(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+func validTCPAddr(addr string) bool {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	port, err := strconv.Atoi(portStr)
+	return err == nil && port > 0 && port <= 65535
+}
+
 func bytesEq(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
@@ -685,4 +796,46 @@ func jsonMarshal(v any) ([]byte, error) {
 
 func jsonUnmarshal(b []byte, v any) error {
 	return json.Unmarshal(b, v)
+}
+
+func (t *Transport) markDialInFlight(addr string) bool {
+	t.dialMu.Lock()
+	defer t.dialMu.Unlock()
+	if _, ok := t.dialInFlight[addr]; ok {
+		return false
+	}
+	t.dialInFlight[addr] = struct{}{}
+	return true
+}
+
+func (t *Transport) clearDialInFlight(addr string) {
+	t.dialMu.Lock()
+	delete(t.dialInFlight, addr)
+	t.dialMu.Unlock()
+}
+
+func (t *Transport) addrDialAllowed(addr string) bool {
+	t.addrMu.Lock()
+	defer t.addrMu.Unlock()
+	info, ok := t.addrBook[addr]
+	if !ok {
+		return true
+	}
+	if info.nextDial.IsZero() {
+		return true
+	}
+	return time.Now().After(info.nextDial)
+}
+
+func (t *Transport) backoffAddrDial(addr string, permanent bool) {
+	t.addrMu.Lock()
+	defer t.addrMu.Unlock()
+	info := t.addrBook[addr]
+	backoff := 900 * time.Millisecond
+	if permanent {
+		backoff = 2 * time.Second
+	}
+	jitter := time.Duration(t.randIntn(250)) * time.Millisecond
+	info.nextDial = time.Now().Add(backoff + jitter)
+	t.addrBook[addr] = info
 }
