@@ -40,6 +40,10 @@ go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:
 ```powershell
 .\scripts\run-tcp-demo.ps1 -BasePort 7000 -Nodes 3 -DurationSec 20 -Difficulty 16 -TxInterval "1s"
 ```
+Linux/macOS（bash）：
+```bash
+./scripts/run-tcp-demo.sh
+```
 
 常用参数：
 - `--nodes` 节点数（默认 2）
@@ -53,6 +57,33 @@ go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:
 - `--max-tx-per-block` 每块最大交易数（默认 50）
 - `--miner-sleep` 每轮挖矿后休眠（默认 10ms）
 - `--seed` 随机种子，便于复现实验
+
+## 常见启动组合
+
+- **seed/引导节点（不注入交易）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7000 --duration=0 --tx-interval=0
+  ```
+- **普通节点（通过 seed 发现 peers）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7001 --seeds=127.0.0.1:7000 --duration=0
+  ```
+- **自定义数据目录（便于重启恢复）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:7000 --data-dir=data/tcp-7002 --duration=0
+  ```
+
+## 快捷命令（Makefile）
+
+```bash
+make build
+make test
+make tcp-demo
+```
+
+## 协议说明
+
+TCP 消息编码与 framing 约定见 [PROTOCOL.md](./PROTOCOL.md)。
 
 ## 运行测试
 
