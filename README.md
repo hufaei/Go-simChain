@@ -44,6 +44,10 @@ Linux/macOS（bash）：
 ```bash
 ./scripts/run-tcp-demo.sh
 ```
+可通过环境变量覆盖默认参数：
+```bash
+BASE_PORT=8000 NODES=4 DURATION_SEC=30 DIFFICULTY=18 TX_INTERVAL=500ms ./scripts/run-tcp-demo.sh
+```
 
 常用参数：
 - `--nodes` 节点数（默认 2）
@@ -95,3 +99,9 @@ go test ./...
 ```powershell
 go test ./internal/integration -run TestTCPE2E -count=1
 ```
+
+### 测试分层建议
+
+- **单元测试**：类型/协议/工具函数的纯逻辑验证（运行快，适合频繁本地执行）。
+- **集成测试**：TCP 端到端流程（包含握手、发现、同步、重启恢复），运行时间更长，但覆盖面更广。
+- **回归策略**：开发中优先跑单元测试，改动 TCP/同步逻辑时再补充集成测试。
