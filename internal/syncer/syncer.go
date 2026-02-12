@@ -108,6 +108,9 @@ type Syncer struct {
 	headerRetries     int
 	headersCh         chan headersResult
 
+	// -------- V3-C: peer performance metrics --------
+	metrics *metricsTracker
+
 	stopCh  chan struct{}
 	doneCh  chan struct{}
 	startMu sync.Mutex
@@ -151,6 +154,8 @@ func New(cfg Config) *Syncer {
 		queuedParent: make(map[types.Hash]string),
 		queuedSync:   make(map[types.Hash]string),
 		queuedInv:    make(map[types.Hash]string),
+
+		metrics: newMetricsTracker(), // V3-C: initialize peer performance tracker
 
 		headersCh: make(chan headersResult, 1),
 	}
@@ -202,8 +207,17 @@ func (s *Syncer) HandleBlock(b *types.Block, fromPeer string) {
 			h = computed
 		}
 	}
-	s.onBlockArrived(h)
 
+	// V3-C: Record successful block response for peer metrics
+	s.mu.Lock()
+	req, ok := s.inflightBlocks[h]
+	s.mu.Unlock()
+	if ok && req != nil && fromPeer != "" {
+		startTime := req.deadline.Add(-s.cfg.SyncTimeout)
+		s.metrics.recordRequest(fromPeer, startTime, true)
+	}
+
+	s.onBlockArrived(h)
 	s.cfg.OnBlock(b, fromPeer)
 }
 
@@ -213,6 +227,25 @@ func (s *Syncer) HandleBlocks(blocks []*types.Block, fromPeer string) {
 	if len(blocks) == 0 || s.cfg.OnBlock == nil {
 		return
 	}
+
+	// V3-C: Record successful batch response for peer metrics
+	// Use the first block to estimate request start time
+	if fromPeer != "" && len(blocks) > 0 {
+		firstHash := blocks[0].Hash
+		if firstHash.IsZero() {
+			if computed, err := crypto.HashHeaderNonce(blocks[0].Header, blocks[0].Nonce); err == nil {
+				firstHash = computed
+			}
+		}
+		s.mu.Lock()
+		req, ok := s.inflightBlocks[firstHash]
+		s.mu.Unlock()
+		if ok && req != nil {
+			startTime := req.deadline.Add(-s.cfg.SyncTimeout)
+			s.metrics.recordRequest(fromPeer, startTime, true)
+		}
+	}
+
 	for _, b := range blocks {
 		if b == nil {
 			continue
@@ -846,6 +879,9 @@ func (s *Syncer) tickInflight(now time.Time) {
 		}
 		if req.peer != "" {
 			timeouts = append(timeouts, req.peer)
+			// V3-C: Record timeout failure for peer metrics
+			startTime := req.deadline.Add(-s.cfg.SyncTimeout)
+			s.metrics.recordRequest(req.peer, startTime, false)
 		}
 		if req.attempts >= s.cfg.BlockRetryLimit {
 			if req.kind == blkSync && (s.state == syncingBlocks || s.state == syncingHeaders) {
