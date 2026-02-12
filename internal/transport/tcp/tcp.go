@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
@@ -19,6 +20,8 @@ import (
 	"simchain-go/internal/identity"
 	"simchain-go/internal/transport"
 	"simchain-go/internal/types"
+
+	"golang.org/x/time/rate"
 )
 
 type Config struct {
@@ -38,8 +41,16 @@ type Config struct {
 	MaxPeers int
 	// OutboundPeers 是目标出站连接数。
 	OutboundPeers int
+	// MaxConnsPerIP 限制每个 IP 的并发连接数 (默认 2)。
+	MaxConnsPerIP int
+
 	// MaxMessageSize 是单条消息最大字节数（用于 framing 限制）。
 	MaxMessageSize int
+
+	// RateLimit 是单连接每秒入站字节数限制 (默认 1MB).
+	RateLimit int
+	// RateBurst 是单连接入站突发字节数限制 (默认 2MB).
+	RateBurst int
 
 	// ReadTimeout/WriteTimeout 是单次读写的超时上限。
 	ReadTimeout  time.Duration
@@ -56,6 +67,7 @@ type Config struct {
 // - 使用 length-prefix framing 处理粘包/拆包
 // - 握手阶段做最小身份绑定（ed25519 challenge-response）
 // - 提供简单的 seed 发现（GetPeers/Peers）
+// - V3-C: 集成连接数限制和速率限制
 type Transport struct {
 	cfg Config
 
@@ -72,6 +84,10 @@ type Transport struct {
 
 	addrMu   sync.Mutex
 	addrBook map[string]addrInfo
+
+	// ipCountMu protects ipCount
+	ipCountMu sync.Mutex
+	ipCount   map[string]int
 
 	rngMu sync.Mutex
 	rng   *mrand.Rand
@@ -110,6 +126,19 @@ func New(cfg Config) (*Transport, error) {
 	if cfg.OutboundPeers <= 0 {
 		cfg.OutboundPeers = 4
 	}
+	if cfg.MaxConnsPerIP <= 0 {
+		cfg.MaxConnsPerIP = 2
+	}
+	if cfg.RateLimit <= 0 { // Default 1MB/s
+		cfg.RateLimit = 1 << 20
+	}
+	if cfg.RateBurst <= 0 { // Default 2MB Burst
+		cfg.RateBurst = 2 << 20
+	}
+	// Burst must be at least MaxMessageSize, otherwise large messages are impossible to read
+	if cfg.RateBurst < cfg.MaxMessageSize {
+		cfg.RateBurst = cfg.MaxMessageSize
+	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 4 * time.Second
 	}
@@ -128,6 +157,7 @@ func New(cfg Config) (*Transport, error) {
 		peers:        make(map[string]*peerConn),
 		dialInFlight: make(map[string]struct{}),
 		addrBook:     make(map[string]addrInfo),
+		ipCount:      make(map[string]int),
 		rng:          mrand.New(mrand.NewSource(time.Now().UnixNano())),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
@@ -254,7 +284,16 @@ func (t *Transport) acceptLoop() {
 			}
 			continue
 		}
+
+		// V3-C: Immediate IP limit check (Anti-DoS)
+		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err == nil && !t.trackIP(host) {
+			_ = conn.Close()
+			continue
+		}
+
 		if !isLoopbackConn(conn) {
+			t.untrackIP(host) // Closed, so untrack
 			_ = conn.Close()
 			continue
 		}
@@ -292,13 +331,29 @@ func (t *Transport) peerDiscoveryLoop() {
 }
 
 func (t *Transport) handleInbound(conn net.Conn) {
+	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	// Ensure cleanup if early return
+	defer func() {
+		// If addPeer failed, we must untrack.
+		// If addPeer succeeded, removePeer will handle untrack.
+		// Use a clever tracking mechanism or just check if it's in peers?
+		// Better: peerConn handles cleanup? No, Transport manages ipCount.
+		// To keep it simple: if not added to peers, untrack.
+	}()
+
 	peerID, peerListen, peerPub, err := t.handshakeInbound(conn)
 	if err != nil {
+		t.untrackIP(host)
 		_ = conn.Close()
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, false, t.cfg.WriteTimeout)
+
+	// Create limiter
+	limiter := rate.NewLimiter(rate.Limit(t.cfg.RateLimit), t.cfg.RateBurst)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, false, t.cfg.WriteTimeout, limiter)
+
 	if !t.addPeer(pc) {
+		t.untrackIP(host)
 		pc.close()
 		return
 	}
@@ -309,25 +364,38 @@ func (t *Transport) handleInbound(conn net.Conn) {
 
 func (t *Transport) handleOutbound(addr string) {
 	defer t.clearDialInFlight(addr)
+
+	// V3-C: Check IP limit before dialing
+	host, _, _ := net.SplitHostPort(addr)
+	if !t.trackIP(host) {
+		return
+	}
+
 	d := net.Dialer{Timeout: t.cfg.ReadTimeout}
 	conn, err := d.Dial("tcp", addr)
 	if err != nil {
+		t.untrackIP(host)
 		t.backoffAddrDial(addr, false)
 		return
 	}
 	if !isLoopbackConn(conn) {
+		t.untrackIP(host)
 		_ = conn.Close()
 		t.backoffAddrDial(addr, true)
 		return
 	}
 	peerID, peerListen, peerPub, err := t.handshakeOutbound(conn)
 	if err != nil {
+		t.untrackIP(host)
 		_ = conn.Close()
 		t.backoffAddrDial(addr, false)
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, true, t.cfg.WriteTimeout)
+
+	limiter := rate.NewLimiter(rate.Limit(t.cfg.RateLimit), t.cfg.RateBurst)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, true, t.cfg.WriteTimeout, limiter)
 	if !t.addPeer(pc) {
+		t.untrackIP(host)
 		pc.close()
 		t.backoffAddrDial(addr, true)
 		return
@@ -343,6 +411,27 @@ func (t *Transport) handleOutbound(addr string) {
 		Payload:   types.GetPeersPayload{Max: 32},
 	}, t.cfg.MaxMessageSize)
 	pc.runReadLoop(t, t.cfg.MaxMessageSize, t.cfg.IdleTimeout, t.cfg.ReadTimeout)
+}
+
+func (t *Transport) trackIP(host string) bool {
+	t.ipCountMu.Lock()
+	defer t.ipCountMu.Unlock()
+	if t.ipCount[host] >= t.cfg.MaxConnsPerIP {
+		return false
+	}
+	t.ipCount[host]++
+	return true
+}
+
+func (t *Transport) untrackIP(host string) {
+	t.ipCountMu.Lock()
+	defer t.ipCountMu.Unlock()
+	if t.ipCount[host] > 0 {
+		t.ipCount[host]--
+		if t.ipCount[host] == 0 {
+			delete(t.ipCount, host)
+		}
+	}
 }
 
 func (t *Transport) addPeer(pc *peerConn) bool {
@@ -375,6 +464,9 @@ func (t *Transport) removePeer(peerID string) {
 	delete(t.peers, peerID)
 	t.mu.Unlock()
 	if pc != nil {
+		// V3-C: Untrack IP when peer is removed
+		host, _, _ := net.SplitHostPort(pc.conn.RemoteAddr().String())
+		t.untrackIP(host)
 		pc.close()
 	}
 }
@@ -783,6 +875,10 @@ func writeFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) 
 }
 
 func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, error) {
+	return readFrameWithLimit(r, max, timeout, nil)
+}
+
+func readFrameWithLimit(r io.Reader, max int, timeout time.Duration, limiter *rate.Limiter) (types.Message, error) {
 	if c, ok := r.(net.Conn); ok && timeout > 0 {
 		_ = c.SetReadDeadline(time.Now().Add(timeout))
 	}
@@ -794,6 +890,24 @@ func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, erro
 	if n <= 0 || n > max {
 		return types.Message{}, errors.New("invalid message length")
 	}
+
+	// V3-C: Apply rate limiting if limiter is provided
+	if limiter != nil {
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		if err := limiter.WaitN(ctx, n); err != nil {
+			return types.Message{}, err
+		}
+		// Reset deadline because WaitN might have consumed time
+		if c, ok := r.(net.Conn); ok && timeout > 0 {
+			_ = c.SetReadDeadline(time.Now().Add(timeout))
+		}
+	}
+
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return types.Message{}, err

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"simchain-go/internal/types"
 )
 
@@ -19,6 +21,9 @@ type peerConn struct {
 
 	conn net.Conn
 
+	// V3-C: Rate limiter for inbound traffic
+	limiter *rate.Limiter
+
 	// writeCh 是有界写队列：保证同一个 net.Conn 只由一个写协程串行写入，避免并发写冲突。
 	writeTimeout time.Duration
 	writeCh      chan []byte
@@ -27,13 +32,14 @@ type peerConn struct {
 	closedCh  chan struct{}
 }
 
-func newPeerConn(id string, listenAddr string, pub ed25519.PublicKey, conn net.Conn, outbound bool, writeTimeout time.Duration) *peerConn {
+func newPeerConn(id string, listenAddr string, pub ed25519.PublicKey, conn net.Conn, outbound bool, writeTimeout time.Duration, limiter *rate.Limiter) *peerConn {
 	pc := &peerConn{
 		id:           id,
 		listenAddr:   listenAddr,
 		pubKey:       pub,
 		outbound:     outbound,
 		conn:         conn,
+		limiter:      limiter,
 		writeTimeout: writeTimeout,
 		writeCh:      make(chan []byte, 128),
 		closedCh:     make(chan struct{}),
@@ -103,7 +109,9 @@ func (p *peerConn) runReadLoop(t *Transport, maxSize int, idleTimeout time.Durat
 		if timeout <= 0 {
 			timeout = readTimeout
 		}
-		msg, err := readFrame(p.conn, maxSize, timeout)
+
+		// V3-C: Use readFrameWithLimit
+		msg, err := readFrameWithLimit(p.conn, maxSize, timeout, p.limiter)
 		if err != nil {
 			p.close()
 			return
