@@ -1,8 +1,7 @@
 package tcp
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -19,6 +18,8 @@ import (
 	"simchain-go/internal/identity"
 	"simchain-go/internal/transport"
 	"simchain-go/internal/types"
+
+	"golang.org/x/time/rate"
 )
 
 type Config struct {
@@ -38,8 +39,16 @@ type Config struct {
 	MaxPeers int
 	// OutboundPeers 是目标出站连接数。
 	OutboundPeers int
+	// MaxConnsPerIP 限制每个 IP 的并发连接数 (默认 2)。
+	MaxConnsPerIP int
+
 	// MaxMessageSize 是单条消息最大字节数（用于 framing 限制）。
 	MaxMessageSize int
+
+	// RateLimit 是单连接每秒入站字节数限制 (默认 1MB).
+	RateLimit int
+	// RateBurst 是单连接入站突发字节数限制 (默认 2MB).
+	RateBurst int
 
 	// ReadTimeout/WriteTimeout 是单次读写的超时上限。
 	ReadTimeout  time.Duration
@@ -56,6 +65,7 @@ type Config struct {
 // - 使用 length-prefix framing 处理粘包/拆包
 // - 握手阶段做最小身份绑定（ed25519 challenge-response）
 // - 提供简单的 seed 发现（GetPeers/Peers）
+// - V3-C: 集成连接数限制和速率限制
 type Transport struct {
 	cfg Config
 
@@ -72,6 +82,10 @@ type Transport struct {
 
 	addrMu   sync.Mutex
 	addrBook map[string]addrInfo
+
+	// ipCountMu protects ipCount
+	ipCountMu sync.Mutex
+	ipCount   map[string]int
 
 	rngMu sync.Mutex
 	rng   *mrand.Rand
@@ -110,6 +124,19 @@ func New(cfg Config) (*Transport, error) {
 	if cfg.OutboundPeers <= 0 {
 		cfg.OutboundPeers = 4
 	}
+	if cfg.MaxConnsPerIP <= 0 {
+		cfg.MaxConnsPerIP = 2
+	}
+	if cfg.RateLimit <= 0 { // Default 1MB/s
+		cfg.RateLimit = 1 << 20
+	}
+	if cfg.RateBurst <= 0 { // Default 2MB Burst
+		cfg.RateBurst = 2 << 20
+	}
+	// Burst must be at least MaxMessageSize, otherwise large messages are impossible to read
+	if cfg.RateBurst < cfg.MaxMessageSize {
+		cfg.RateBurst = cfg.MaxMessageSize
+	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 4 * time.Second
 	}
@@ -128,6 +155,7 @@ func New(cfg Config) (*Transport, error) {
 		peers:        make(map[string]*peerConn),
 		dialInFlight: make(map[string]struct{}),
 		addrBook:     make(map[string]addrInfo),
+		ipCount:      make(map[string]int),
 		rng:          mrand.New(mrand.NewSource(time.Now().UnixNano())),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
@@ -254,7 +282,16 @@ func (t *Transport) acceptLoop() {
 			}
 			continue
 		}
+
+		// V3-C: Immediate IP limit check (Anti-DoS)
+		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err == nil && !t.trackIP(host) {
+			_ = conn.Close()
+			continue
+		}
+
 		if !isLoopbackConn(conn) {
+			t.untrackIP(host) // Closed, so untrack
 			_ = conn.Close()
 			continue
 		}
@@ -292,13 +329,33 @@ func (t *Transport) peerDiscoveryLoop() {
 }
 
 func (t *Transport) handleInbound(conn net.Conn) {
-	peerID, peerListen, peerPub, err := t.handshakeInbound(conn)
+	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	// Ensure cleanup if early return
+	defer func() {
+		// If addPeer failed, we must untrack.
+		// If addPeer succeeded, removePeer will handle untrack.
+		// Use a clever tracking mechanism or just check if it's in peers?
+		// Better: peerConn handles cleanup? No, Transport manages ipCount.
+		// To keep it simple: if not added to peers, untrack.
+	}()
+
+	peerID, peerListen, peerPub, err := HandshakeInbound(
+		conn, t.localID, t.cfg.Identity.PrivateKey, t.cfg.Identity.PublicKey,
+		t.cfg.ListenAddr, t.cfg.Magic, t.cfg.Version,
+		t.cfg.MaxMessageSize, t.cfg.ReadTimeout, t.cfg.WriteTimeout,
+	)
 	if err != nil {
+		t.untrackIP(host)
 		_ = conn.Close()
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, false, t.cfg.WriteTimeout)
+
+	// Create limiter
+	limiter := rate.NewLimiter(rate.Limit(t.cfg.RateLimit), t.cfg.RateBurst)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, false, t.cfg.WriteTimeout, limiter)
+
 	if !t.addPeer(pc) {
+		t.untrackIP(host)
 		pc.close()
 		return
 	}
@@ -309,25 +366,42 @@ func (t *Transport) handleInbound(conn net.Conn) {
 
 func (t *Transport) handleOutbound(addr string) {
 	defer t.clearDialInFlight(addr)
+
+	// V3-C: Check IP limit before dialing
+	host, _, _ := net.SplitHostPort(addr)
+	if !t.trackIP(host) {
+		return
+	}
+
 	d := net.Dialer{Timeout: t.cfg.ReadTimeout}
 	conn, err := d.Dial("tcp", addr)
 	if err != nil {
+		t.untrackIP(host)
 		t.backoffAddrDial(addr, false)
 		return
 	}
 	if !isLoopbackConn(conn) {
+		t.untrackIP(host)
 		_ = conn.Close()
 		t.backoffAddrDial(addr, true)
 		return
 	}
-	peerID, peerListen, peerPub, err := t.handshakeOutbound(conn)
+	peerID, peerListen, peerPub, err := HandshakeOutbound(
+		conn, t.localID, t.cfg.Identity.PrivateKey, t.cfg.Identity.PublicKey,
+		t.cfg.ListenAddr, t.cfg.Magic, t.cfg.Version,
+		t.cfg.MaxMessageSize, t.cfg.ReadTimeout, t.cfg.WriteTimeout,
+	)
 	if err != nil {
+		t.untrackIP(host)
 		_ = conn.Close()
 		t.backoffAddrDial(addr, false)
 		return
 	}
-	pc := newPeerConn(peerID, peerListen, peerPub, conn, true, t.cfg.WriteTimeout)
+
+	limiter := rate.NewLimiter(rate.Limit(t.cfg.RateLimit), t.cfg.RateBurst)
+	pc := newPeerConn(peerID, peerListen, peerPub, conn, true, t.cfg.WriteTimeout, limiter)
 	if !t.addPeer(pc) {
+		t.untrackIP(host)
 		pc.close()
 		t.backoffAddrDial(addr, true)
 		return
@@ -343,6 +417,27 @@ func (t *Transport) handleOutbound(addr string) {
 		Payload:   types.GetPeersPayload{Max: 32},
 	}, t.cfg.MaxMessageSize)
 	pc.runReadLoop(t, t.cfg.MaxMessageSize, t.cfg.IdleTimeout, t.cfg.ReadTimeout)
+}
+
+func (t *Transport) trackIP(host string) bool {
+	t.ipCountMu.Lock()
+	defer t.ipCountMu.Unlock()
+	if t.ipCount[host] >= t.cfg.MaxConnsPerIP {
+		return false
+	}
+	t.ipCount[host]++
+	return true
+}
+
+func (t *Transport) untrackIP(host string) {
+	t.ipCountMu.Lock()
+	defer t.ipCountMu.Unlock()
+	if t.ipCount[host] > 0 {
+		t.ipCount[host]--
+		if t.ipCount[host] == 0 {
+			delete(t.ipCount, host)
+		}
+	}
 }
 
 func (t *Transport) addPeer(pc *peerConn) bool {
@@ -375,6 +470,9 @@ func (t *Transport) removePeer(peerID string) {
 	delete(t.peers, peerID)
 	t.mu.Unlock()
 	if pc != nil {
+		// V3-C: Untrack IP when peer is removed
+		host, _, _ := net.SplitHostPort(pc.conn.RemoteAddr().String())
+		t.untrackIP(host)
 		pc.close()
 	}
 }
@@ -565,152 +663,6 @@ func (t *Transport) ensureLoopbackListenAddr() error {
 	return nil
 }
 
-func handshakeSigMsg(nonce []byte, magic string, version int) []byte {
-	var v [4]byte
-	binary.LittleEndian.PutUint32(v[:], uint32(version))
-	b := make([]byte, 0, len(nonce)+len(magic)+len(v))
-	b = append(b, nonce...)
-	b = append(b, []byte(magic)...)
-	b = append(b, v[:]...)
-	return b
-}
-
-func (t *Transport) handshakeOutbound(conn net.Conn) (peerID string, peerListen string, peerPub ed25519.PublicKey, err error) {
-	nonceA := make([]byte, 32)
-	if _, err := rand.Read(nonceA); err != nil {
-		return "", "", nil, err
-	}
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgHello,
-		From:      t.localID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.HelloPayload{
-			Magic:      t.cfg.Magic,
-			Version:    t.cfg.Version,
-			PubKey:     []byte(t.cfg.Identity.PublicKey),
-			ListenAddr: t.cfg.ListenAddr,
-			Nonce:      nonceA,
-			Timestamp:  time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-	msg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if msg.Type != types.MsgHelloAck {
-		return "", "", nil, errors.New("expected HelloAck")
-	}
-	ack, ok := msg.Payload.(types.HelloAckPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid HelloAck payload")
-	}
-	if ack.Magic != t.cfg.Magic || ack.Version != t.cfg.Version {
-		return "", "", nil, errors.New("magic/version mismatch")
-	}
-	if !bytesEq(ack.EchoNonce, nonceA) {
-		return "", "", nil, errors.New("hello echo nonce mismatch")
-	}
-	if len(ack.PubKey) != ed25519.PublicKeySize || len(ack.Nonce) == 0 {
-		return "", "", nil, errors.New("invalid responder pubkey/nonce")
-	}
-	peerPub = ed25519.PublicKey(append([]byte(nil), ack.PubKey...))
-	if !ed25519.Verify(peerPub, handshakeSigMsg(nonceA, t.cfg.Magic, t.cfg.Version), ack.SigOverEcho) {
-		return "", "", nil, errors.New("responder signature invalid")
-	}
-	peerID, err = identity.NodeIDFromPublicKey(peerPub)
-	if err != nil {
-		return "", "", nil, err
-	}
-	peerListen = ack.ListenAddr
-
-	sig := ed25519.Sign(t.cfg.Identity.PrivateKey, handshakeSigMsg(ack.Nonce, t.cfg.Magic, t.cfg.Version))
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgAuth,
-		From:      t.localID,
-		To:        peerID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.AuthPayload{
-			EchoNonce: ack.Nonce,
-			Sig:       sig,
-			Timestamp: time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-	return peerID, peerListen, peerPub, nil
-}
-
-func (t *Transport) handshakeInbound(conn net.Conn) (peerID string, peerListen string, peerPub ed25519.PublicKey, err error) {
-	msg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if msg.Type != types.MsgHello {
-		return "", "", nil, errors.New("expected Hello")
-	}
-	hello, ok := msg.Payload.(types.HelloPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid Hello payload")
-	}
-	if hello.Magic != t.cfg.Magic || hello.Version != t.cfg.Version {
-		return "", "", nil, errors.New("magic/version mismatch")
-	}
-	if len(hello.PubKey) != ed25519.PublicKeySize || len(hello.Nonce) == 0 {
-		return "", "", nil, errors.New("invalid initiator pubkey/nonce")
-	}
-	peerPub = ed25519.PublicKey(append([]byte(nil), hello.PubKey...))
-	peerID, err = identity.NodeIDFromPublicKey(peerPub)
-	if err != nil {
-		return "", "", nil, err
-	}
-	peerListen = hello.ListenAddr
-
-	nonceB := make([]byte, 32)
-	if _, err := rand.Read(nonceB); err != nil {
-		return "", "", nil, err
-	}
-	sigB := ed25519.Sign(t.cfg.Identity.PrivateKey, handshakeSigMsg(hello.Nonce, t.cfg.Magic, t.cfg.Version))
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgHelloAck,
-		From:      t.localID,
-		To:        peerID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.HelloAckPayload{
-			Magic:       t.cfg.Magic,
-			Version:     t.cfg.Version,
-			PubKey:      []byte(t.cfg.Identity.PublicKey),
-			ListenAddr:  t.cfg.ListenAddr,
-			Nonce:       nonceB,
-			EchoNonce:   hello.Nonce,
-			SigOverEcho: sigB,
-			Timestamp:   time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-
-	authMsg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if authMsg.Type != types.MsgAuth {
-		return "", "", nil, errors.New("expected Auth")
-	}
-	auth, ok := authMsg.Payload.(types.AuthPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid Auth payload")
-	}
-	if !bytesEq(auth.EchoNonce, nonceB) {
-		return "", "", nil, errors.New("auth echo nonce mismatch")
-	}
-	if !ed25519.Verify(peerPub, handshakeSigMsg(nonceB, t.cfg.Magic, t.cfg.Version), auth.Sig) {
-		return "", "", nil, errors.New("initiator signature invalid")
-	}
-	return peerID, peerListen, peerPub, nil
-}
-
 func isLoopbackConn(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -744,18 +696,6 @@ func validTCPAddr(addr string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func encodeFrame(msg types.Message, max int) ([]byte, error) {
 	raw, err := json.Marshal(msg)
 	if err != nil {
@@ -770,7 +710,7 @@ func encodeFrame(msg types.Message, max int) ([]byte, error) {
 	return out, nil
 }
 
-func writeFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) error {
+func WriteFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) error {
 	if c, ok := w.(net.Conn); ok && timeout > 0 {
 		_ = c.SetWriteDeadline(time.Now().Add(timeout))
 	}
@@ -782,7 +722,11 @@ func writeFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) 
 	return err
 }
 
-func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, error) {
+func ReadFrame(r io.Reader, max int, timeout time.Duration) (types.Message, error) {
+	return ReadFrameWithLimit(r, max, timeout, nil)
+}
+
+func ReadFrameWithLimit(r io.Reader, max int, timeout time.Duration, limiter *rate.Limiter) (types.Message, error) {
 	if c, ok := r.(net.Conn); ok && timeout > 0 {
 		_ = c.SetReadDeadline(time.Now().Add(timeout))
 	}
@@ -794,6 +738,24 @@ func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, erro
 	if n <= 0 || n > max {
 		return types.Message{}, errors.New("invalid message length")
 	}
+
+	// V3-C: Apply rate limiting if limiter is provided
+	if limiter != nil {
+		ctx := context.Background()
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+		if err := limiter.WaitN(ctx, n); err != nil {
+			return types.Message{}, err
+		}
+		// Reset deadline because WaitN might have consumed time
+		if c, ok := r.(net.Conn); ok && timeout > 0 {
+			_ = c.SetReadDeadline(time.Now().Add(timeout))
+		}
+	}
+
 	buf := make([]byte, n)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return types.Message{}, err

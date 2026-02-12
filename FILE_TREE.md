@@ -1,4 +1,153 @@
-# simchain-go 文件结构与职责（V1 + V2 + V3-A）
+# simchain-go 文件结构与职责（V1 ~ V3）
+
+本文档描述当前仓库的目录结构与各模块职责。
+
+---
+
+## 目录树
+
+```
+simchain-go/
+├── cmd/
+│   ├── node/
+│   │   └── main.go              # 节点主程序（支持 inproc/TCP 两种模式）
+│   └── cli/
+│       └── main.go              # 命令行客户端（提交交易）
+│
+├── internal/
+│   ├── types/                   # 协议与数据结构
+│   │   ├── transaction.go       # Transaction{ID, Timestamp, Payload}
+│   │   ├── block.go             # Hash/BlockHeader/Block/BlockMeta
+│   │   └── message.go           # 消息类型与 Payload 定义
+│   │
+│   ├── crypto/                  # PoW 与哈希
+│   │   ├── pow.go               # HashHeaderNonce, MeetsDifficulty
+│   │   └── pow_test.go
+│   │
+│   ├── mempool/                 # 交易池（TTL + 容量限制）
+│   │   ├── mempool.go           # Add/Pop/CleanExpired/CanBroadcast
+│   │   └── mempool_test.go
+│   │
+│   ├── blockchain/              # 链索引与 reorg
+│   │   ├── chain.go             # AddBlock, Locator, cumWork, reorg
+│   │   └── chain_test.go
+│   │
+│   ├── network/                 # 内存网络内核（inproc 底层）
+│   │   └── bus.go               # Broadcast/Send + 延迟/丢包注入
+│   │
+│   ├── transport/               # 传输抽象层
+│   │   ├── transport.go         # Transport 接口定义
+│   │   ├── inproc/
+│   │   │   └── inproc.go        # 进程内传输
+│   │   └── tcp/
+│   │       ├── tcp.go           # TCP 传输实现
+│   │       ├── peerconn.go      # 单连接管理
+│   │       ├── handshake.go     # ed25519 握手协议
+│   │       └── *_test.go
+│   │
+│   ├── syncer/                  # 同步状态机
+│   │   ├── syncer.go            # Headers-first + 窗口下载 + 重试
+│   │   ├── metrics.go           # Peer 性能指标
+│   │   └── metrics_test.go
+│   │
+│   ├── peer/                    # Peer 管理
+│   │   └── peermanager.go       # BestPeer 选择 + 冷却/退避
+│   │
+│   ├── store/                   # 主链持久化
+│   │   └── store.go             # ApplyTipChange, LoadMainChain
+│   │
+│   ├── identity/                # 节点身份
+│   │   └── identity.go          # ed25519 密钥管理
+│   │
+│   ├── node/                    # 节点编排
+│   │   └── node.go              # Miner + HandleMessage
+│   │
+│   └── integration/             # 集成测试
+│       └── tcp_test.go
+│
+├── scripts/
+│   ├── run-tcp-demo.ps1         # Windows TCP 演示
+│   └── run-tcp-demo.sh          # Linux/Mac TCP 演示
+│
+├── data/                        # 运行时数据目录
+│   └── <nodeID>/
+│       ├── manifest.json
+│       ├── node_key.json
+│       └── blocks/*.json
+│
+├── testPool.ps1                 # Mempool 容量测试
+├── verify_v3c.py                # TCP 连接限制测试
+│
+├── DESIGN.md                    # V1 设计文档
+├── DESIGN_V2.md                 # V2 设计文档
+├── DESIGN_V3_UNIFIED.md         # V3 统一设计文档
+├── PROTOCOL.md                  # 协议规范
+├── FILE_TREE.md                 # 本文件
+├── README.md
+├── Makefile
+├── go.mod
+└── go.sum
+```
+
+---
+
+## 模块职责
+
+### cmd/
+
+| 目录 | 职责 |
+|------|------|
+| `cmd/node/` | 节点主程序，支持 inproc 单进程仿真或 TCP 多进程网络 |
+| `cmd/cli/` | 命令行客户端，提交交易到节点 |
+
+### internal/
+
+| 模块 | 职责 |
+|------|------|
+| **types/** | 交易、区块、消息数据结构 |
+| **crypto/** | PoW 哈希与难度校验 |
+| **mempool/** | 交易池（TTL 清理 + 容量限制） |
+| **blockchain/** | 链索引、cumWork、reorg 计算 |
+| **network/** | 内存网络内核 |
+| **transport/** | 网络传输抽象（inproc/TCP） |
+| **syncer/** | headers-first 同步状态机 |
+| **peer/** | Peer 评分与选择 |
+| **store/** | 主链持久化 |
+| **identity/** | ed25519 密钥管理 |
+| **node/** | 节点编排（挖矿 + 消息路由） |
+
+### 脚本
+
+| 文件 | 用途 |
+|------|------|
+| `testPool.ps1` | 测试 Mempool 5000 容量限制 |
+| `verify_v3c.py` | 测试 TCP 连接限制与 Slowloris 防护 |
+
+---
+
+## 数据流
+
+```
+交易 → Mempool → Miner 打包 → PoW → Chain.AddBlock
+                                        ↓
+                                  Store 持久化
+                                        ↓
+                              Transport 广播 InvBlock
+                                        ↓
+                              Syncer 拉取 → Chain.AddBlock
+                                        ↓
+                                  reorg → Mempool 调整
+```
+
+---
+
+## 版本
+
+| 版本 | 变更 |
+|------|------|
+| V1 | PoW + 全广播 |
+| V2 | Inv/Get 按需拉取 |
+| V3 | TCP 网络 + 持久化 + 健壮性 |
 
 本文按 `DESIGN.md`（V1）、`DESIGN_V2.md`（V2：inv 公告 + 按需拉取）、`DESIGN_V3.md`（V3-A：Transport/Syncer/Store 拆分 + 主链持久化）来解读当前仓库：每个目录/文件在系统中承担什么职责，以及它们如何拼出“交易产生 → 传播 → 挖矿出块 → 分叉/重组 → 收敛 → 主链落盘”的全流程。
 

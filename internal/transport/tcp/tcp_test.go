@@ -45,10 +45,10 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 	writeErr := make(chan error, 1)
 	go func() {
-		writeErr <- writeFrame(a, want, 1<<20, 2*time.Second)
+		writeErr <- WriteFrame(a, want, 1<<20, 2*time.Second)
 	}()
 
-	got, err := readFrame(b, 1<<20, 2*time.Second)
+	got, err := ReadFrame(b, 1<<20, 2*time.Second)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
@@ -98,11 +98,19 @@ func TestHandshakePipeSuccess(t *testing.T) {
 	}
 	done := make(chan res, 1)
 	go func() {
-		pid, _, _, err := respTr.handshakeInbound(b)
+		pid, _, _, err := HandshakeInbound(
+			b, respTr.localID, respTr.cfg.Identity.PrivateKey, respTr.cfg.Identity.PublicKey,
+			respTr.cfg.ListenAddr, respTr.cfg.Magic, respTr.cfg.Version,
+			respTr.cfg.MaxMessageSize, respTr.cfg.ReadTimeout, respTr.cfg.WriteTimeout,
+		)
 		done <- res{peerID: pid, err: err}
 	}()
 
-	outPeerID, _, _, err := initTr.handshakeOutbound(a)
+	outPeerID, _, _, err := HandshakeOutbound(
+		a, initTr.localID, initTr.cfg.Identity.PrivateKey, initTr.cfg.Identity.PublicKey,
+		initTr.cfg.ListenAddr, initTr.cfg.Magic, initTr.cfg.Version,
+		initTr.cfg.MaxMessageSize, initTr.cfg.ReadTimeout, initTr.cfg.WriteTimeout,
+	)
 	if err != nil {
 		t.Fatalf("outbound handshake: %v", err)
 	}
@@ -145,13 +153,21 @@ func TestHandshakeRejectsMagicMismatch(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, _, _, err := respTr.handshakeInbound(b)
+		_, _, _, err := HandshakeInbound(
+			b, respTr.localID, respTr.cfg.Identity.PrivateKey, respTr.cfg.Identity.PublicKey,
+			respTr.cfg.ListenAddr, respTr.cfg.Magic, respTr.cfg.Version,
+			respTr.cfg.MaxMessageSize, respTr.cfg.ReadTimeout, respTr.cfg.WriteTimeout,
+		)
 		// 主动关闭 b，避免对端一直卡在 read。
 		_ = b.Close()
 		done <- err
 	}()
 
-	_, _, _, err = initTr.handshakeOutbound(a)
+	_, _, _, err = HandshakeOutbound(
+		a, initTr.localID, initTr.cfg.Identity.PrivateKey, initTr.cfg.Identity.PublicKey,
+		initTr.cfg.ListenAddr, initTr.cfg.Magic, initTr.cfg.Version,
+		initTr.cfg.MaxMessageSize, initTr.cfg.ReadTimeout, initTr.cfg.WriteTimeout,
+	)
 	if err == nil {
 		t.Fatalf("expected outbound handshake error")
 	}
