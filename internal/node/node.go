@@ -137,10 +137,26 @@ func NewNode(id string, chain *blockchain.Blockchain, mp *mempool.Mempool, tr tr
 		OnBlock:         n.onNewBlock,
 	})
 
+	// V3-C: Start mempool cleanup loop
+	go n.mempoolCleanupLoop()
+
 	return n
 }
 
 func (n *Node) ID() string { return n.id }
+
+func (n *Node) mempoolCleanupLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-n.stopCh:
+			return
+		case <-ticker.C:
+			n.mempool.CleanExpired()
+		}
+	}
+}
 
 func (n *Node) StartMining() {
 	go n.minerLoop()
@@ -182,22 +198,39 @@ func (n *Node) HashAttempts() uint64 {
 
 func (n *Node) SubmitTransaction(payload string) {
 	tx := types.NewTransaction(payload)
-	if !n.mempool.Add(tx) {
-		return
+	added := n.mempool.Add(tx)
+
+	if added {
+		n.rememberTx(tx)
+		log.Printf("TX_ACCEPTED node=%s tx=%s", n.id, tx.ID)
 	}
-	n.rememberTx(tx)
-	log.Printf("TX_ACCEPTED node=%s tx=%s", n.id, tx.ID)
-	if n.tr == nil {
-		return
+
+	// V3-C: Broadcast if added OR if allowed by cooldown (rebroadcast)
+	if added || n.mempool.CanBroadcast(tx.ID) {
+		if n.tr == nil {
+			return
+		}
+		// If not added but broadcasting, it means we are rebroadcasting an existing tx.
+		// Ensure we remember it (should accept idempotent calls)
+		if !added {
+			// Check if we actually have it (it might be rejected due to full mempool)
+			if !n.hasTx(tx.ID) {
+				// Rejected due to capacity or other reasons, do not broadcast
+				return
+			}
+			log.Printf("TX_REBROADCAST node=%s tx=%s", n.id, tx.ID)
+		}
+
+		msg := types.Message{
+			Type:      types.MsgInvTx,
+			From:      n.id,
+			Timestamp: time.Now().UnixMilli(),
+			Payload:   types.InvTxPayload{TxID: tx.ID},
+		}
+		// V2/V3：只广播 txid（InvTx），完整交易通过 GetTx/Tx 按需拉取。
+		n.tr.Broadcast(n.id, msg)
+		n.mempool.MarkBroadcast(tx.ID)
 	}
-	msg := types.Message{
-		Type:      types.MsgInvTx,
-		From:      n.id,
-		Timestamp: time.Now().UnixMilli(),
-		Payload:   types.InvTxPayload{TxID: tx.ID},
-	}
-	// V2/V3：只广播 txid（InvTx），完整交易通过 GetTx/Tx 按需拉取。
-	n.tr.Broadcast(n.id, msg)
 }
 
 func (n *Node) HandleMessage(msg types.Message) {
