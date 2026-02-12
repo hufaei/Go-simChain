@@ -40,6 +40,14 @@ go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:
 ```powershell
 .\scripts\run-tcp-demo.ps1 -BasePort 7000 -Nodes 3 -DurationSec 20 -Difficulty 16 -TxInterval "1s"
 ```
+Linux/macOS（bash）：
+```bash
+./scripts/run-tcp-demo.sh
+```
+可通过环境变量覆盖默认参数：
+```bash
+BASE_PORT=8000 NODES=4 DURATION_SEC=30 DIFFICULTY=18 TX_INTERVAL=500ms ./scripts/run-tcp-demo.sh
+```
 
 常用参数：
 - `--nodes` 节点数（默认 2）
@@ -54,6 +62,33 @@ go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:
 - `--miner-sleep` 每轮挖矿后休眠（默认 10ms）
 - `--seed` 随机种子，便于复现实验
 
+## 常见启动组合
+
+- **seed/引导节点（不注入交易）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7000 --duration=0 --tx-interval=0
+  ```
+- **普通节点（通过 seed 发现 peers）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7001 --seeds=127.0.0.1:7000 --duration=0
+  ```
+- **自定义数据目录（便于重启恢复）**：
+  ```powershell
+  go run ./cmd/simchain --transport=tcp --listen=127.0.0.1:7002 --seeds=127.0.0.1:7000 --data-dir=data/tcp-7002 --duration=0
+  ```
+
+## 快捷命令（Makefile）
+
+```bash
+make build
+make test
+make tcp-demo
+```
+
+## 协议说明
+
+TCP 消息编码与 framing 约定见 [PROTOCOL.md](./PROTOCOL.md)。
+
 ## 运行测试
 
 ```powershell
@@ -64,3 +99,9 @@ go test ./...
 ```powershell
 go test ./internal/integration -run TestTCPE2E -count=1
 ```
+
+### 测试分层建议
+
+- **单元测试**：类型/协议/工具函数的纯逻辑验证（运行快，适合频繁本地执行）。
+- **集成测试**：TCP 端到端流程（包含握手、发现、同步、重启恢复），运行时间更长，但覆盖面更广。
+- **回归策略**：开发中优先跑单元测试，改动 TCP/同步逻辑时再补充集成测试。
