@@ -159,7 +159,7 @@ func TestReadFrameWithLimit(t *testing.T) {
 	start := time.Now()
 	// Read frame. Need ~2700 tokens. Rate 1024/s.
 	// Time needed = 2700 / 1024 = ~2.6 seconds.
-	_, err := readFrameWithLimit(pr, 10000, 5*time.Second, limiter)
+	_, err := ReadFrameWithLimit(pr, 10000, 5*time.Second, limiter)
 	if err != nil {
 		t.Fatalf("ReadFrame failed: %v", err)
 	}

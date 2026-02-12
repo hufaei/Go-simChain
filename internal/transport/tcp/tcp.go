@@ -2,8 +2,6 @@ package tcp
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -341,7 +339,11 @@ func (t *Transport) handleInbound(conn net.Conn) {
 		// To keep it simple: if not added to peers, untrack.
 	}()
 
-	peerID, peerListen, peerPub, err := t.handshakeInbound(conn)
+	peerID, peerListen, peerPub, err := HandshakeInbound(
+		conn, t.localID, t.cfg.Identity.PrivateKey, t.cfg.Identity.PublicKey,
+		t.cfg.ListenAddr, t.cfg.Magic, t.cfg.Version,
+		t.cfg.MaxMessageSize, t.cfg.ReadTimeout, t.cfg.WriteTimeout,
+	)
 	if err != nil {
 		t.untrackIP(host)
 		_ = conn.Close()
@@ -384,7 +386,11 @@ func (t *Transport) handleOutbound(addr string) {
 		t.backoffAddrDial(addr, true)
 		return
 	}
-	peerID, peerListen, peerPub, err := t.handshakeOutbound(conn)
+	peerID, peerListen, peerPub, err := HandshakeOutbound(
+		conn, t.localID, t.cfg.Identity.PrivateKey, t.cfg.Identity.PublicKey,
+		t.cfg.ListenAddr, t.cfg.Magic, t.cfg.Version,
+		t.cfg.MaxMessageSize, t.cfg.ReadTimeout, t.cfg.WriteTimeout,
+	)
 	if err != nil {
 		t.untrackIP(host)
 		_ = conn.Close()
@@ -657,152 +663,6 @@ func (t *Transport) ensureLoopbackListenAddr() error {
 	return nil
 }
 
-func handshakeSigMsg(nonce []byte, magic string, version int) []byte {
-	var v [4]byte
-	binary.LittleEndian.PutUint32(v[:], uint32(version))
-	b := make([]byte, 0, len(nonce)+len(magic)+len(v))
-	b = append(b, nonce...)
-	b = append(b, []byte(magic)...)
-	b = append(b, v[:]...)
-	return b
-}
-
-func (t *Transport) handshakeOutbound(conn net.Conn) (peerID string, peerListen string, peerPub ed25519.PublicKey, err error) {
-	nonceA := make([]byte, 32)
-	if _, err := rand.Read(nonceA); err != nil {
-		return "", "", nil, err
-	}
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgHello,
-		From:      t.localID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.HelloPayload{
-			Magic:      t.cfg.Magic,
-			Version:    t.cfg.Version,
-			PubKey:     []byte(t.cfg.Identity.PublicKey),
-			ListenAddr: t.cfg.ListenAddr,
-			Nonce:      nonceA,
-			Timestamp:  time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-	msg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if msg.Type != types.MsgHelloAck {
-		return "", "", nil, errors.New("expected HelloAck")
-	}
-	ack, ok := msg.Payload.(types.HelloAckPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid HelloAck payload")
-	}
-	if ack.Magic != t.cfg.Magic || ack.Version != t.cfg.Version {
-		return "", "", nil, errors.New("magic/version mismatch")
-	}
-	if !bytesEq(ack.EchoNonce, nonceA) {
-		return "", "", nil, errors.New("hello echo nonce mismatch")
-	}
-	if len(ack.PubKey) != ed25519.PublicKeySize || len(ack.Nonce) == 0 {
-		return "", "", nil, errors.New("invalid responder pubkey/nonce")
-	}
-	peerPub = ed25519.PublicKey(append([]byte(nil), ack.PubKey...))
-	if !ed25519.Verify(peerPub, handshakeSigMsg(nonceA, t.cfg.Magic, t.cfg.Version), ack.SigOverEcho) {
-		return "", "", nil, errors.New("responder signature invalid")
-	}
-	peerID, err = identity.NodeIDFromPublicKey(peerPub)
-	if err != nil {
-		return "", "", nil, err
-	}
-	peerListen = ack.ListenAddr
-
-	sig := ed25519.Sign(t.cfg.Identity.PrivateKey, handshakeSigMsg(ack.Nonce, t.cfg.Magic, t.cfg.Version))
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgAuth,
-		From:      t.localID,
-		To:        peerID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.AuthPayload{
-			EchoNonce: ack.Nonce,
-			Sig:       sig,
-			Timestamp: time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-	return peerID, peerListen, peerPub, nil
-}
-
-func (t *Transport) handshakeInbound(conn net.Conn) (peerID string, peerListen string, peerPub ed25519.PublicKey, err error) {
-	msg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if msg.Type != types.MsgHello {
-		return "", "", nil, errors.New("expected Hello")
-	}
-	hello, ok := msg.Payload.(types.HelloPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid Hello payload")
-	}
-	if hello.Magic != t.cfg.Magic || hello.Version != t.cfg.Version {
-		return "", "", nil, errors.New("magic/version mismatch")
-	}
-	if len(hello.PubKey) != ed25519.PublicKeySize || len(hello.Nonce) == 0 {
-		return "", "", nil, errors.New("invalid initiator pubkey/nonce")
-	}
-	peerPub = ed25519.PublicKey(append([]byte(nil), hello.PubKey...))
-	peerID, err = identity.NodeIDFromPublicKey(peerPub)
-	if err != nil {
-		return "", "", nil, err
-	}
-	peerListen = hello.ListenAddr
-
-	nonceB := make([]byte, 32)
-	if _, err := rand.Read(nonceB); err != nil {
-		return "", "", nil, err
-	}
-	sigB := ed25519.Sign(t.cfg.Identity.PrivateKey, handshakeSigMsg(hello.Nonce, t.cfg.Magic, t.cfg.Version))
-	if err := writeFrame(conn, types.Message{
-		Type:      types.MsgHelloAck,
-		From:      t.localID,
-		To:        peerID,
-		Timestamp: time.Now().UnixMilli(),
-		Payload: types.HelloAckPayload{
-			Magic:       t.cfg.Magic,
-			Version:     t.cfg.Version,
-			PubKey:      []byte(t.cfg.Identity.PublicKey),
-			ListenAddr:  t.cfg.ListenAddr,
-			Nonce:       nonceB,
-			EchoNonce:   hello.Nonce,
-			SigOverEcho: sigB,
-			Timestamp:   time.Now().UnixMilli(),
-		},
-	}, t.cfg.MaxMessageSize, t.cfg.WriteTimeout); err != nil {
-		return "", "", nil, err
-	}
-
-	authMsg, err := readFrame(conn, t.cfg.MaxMessageSize, t.cfg.ReadTimeout)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if authMsg.Type != types.MsgAuth {
-		return "", "", nil, errors.New("expected Auth")
-	}
-	auth, ok := authMsg.Payload.(types.AuthPayload)
-	if !ok {
-		return "", "", nil, errors.New("invalid Auth payload")
-	}
-	if !bytesEq(auth.EchoNonce, nonceB) {
-		return "", "", nil, errors.New("auth echo nonce mismatch")
-	}
-	if !ed25519.Verify(peerPub, handshakeSigMsg(nonceB, t.cfg.Magic, t.cfg.Version), auth.Sig) {
-		return "", "", nil, errors.New("initiator signature invalid")
-	}
-	return peerID, peerListen, peerPub, nil
-}
-
 func isLoopbackConn(conn net.Conn) bool {
 	if conn == nil {
 		return false
@@ -836,18 +696,6 @@ func validTCPAddr(addr string) bool {
 	return err == nil && port > 0 && port <= 65535
 }
 
-func bytesEq(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func encodeFrame(msg types.Message, max int) ([]byte, error) {
 	raw, err := json.Marshal(msg)
 	if err != nil {
@@ -862,7 +710,7 @@ func encodeFrame(msg types.Message, max int) ([]byte, error) {
 	return out, nil
 }
 
-func writeFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) error {
+func WriteFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) error {
 	if c, ok := w.(net.Conn); ok && timeout > 0 {
 		_ = c.SetWriteDeadline(time.Now().Add(timeout))
 	}
@@ -874,11 +722,11 @@ func writeFrame(w io.Writer, msg types.Message, max int, timeout time.Duration) 
 	return err
 }
 
-func readFrame(r io.Reader, max int, timeout time.Duration) (types.Message, error) {
-	return readFrameWithLimit(r, max, timeout, nil)
+func ReadFrame(r io.Reader, max int, timeout time.Duration) (types.Message, error) {
+	return ReadFrameWithLimit(r, max, timeout, nil)
 }
 
-func readFrameWithLimit(r io.Reader, max int, timeout time.Duration, limiter *rate.Limiter) (types.Message, error) {
+func ReadFrameWithLimit(r io.Reader, max int, timeout time.Duration, limiter *rate.Limiter) (types.Message, error) {
 	if c, ok := r.(net.Conn); ok && timeout > 0 {
 		_ = c.SetReadDeadline(time.Now().Add(timeout))
 	}

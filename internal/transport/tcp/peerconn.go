@@ -111,7 +111,7 @@ func (p *peerConn) runReadLoop(t *Transport, maxSize int, idleTimeout time.Durat
 		}
 
 		// V3-C: Use readFrameWithLimit
-		msg, err := readFrameWithLimit(p.conn, maxSize, timeout, p.limiter)
+		msg, err := ReadFrameWithLimit(p.conn, maxSize, timeout, p.limiter)
 		if err != nil {
 			p.close()
 			return

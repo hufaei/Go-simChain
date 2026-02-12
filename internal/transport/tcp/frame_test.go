@@ -22,9 +22,9 @@ func TestFrameEncodeDecodeRoundTrip(t *testing.T) {
 		t.Fatalf("encodeFrame: %v", err)
 	}
 
-	got, err := readFrame(bytes.NewReader(frame), 1024, 0)
+	got, err := ReadFrame(bytes.NewReader(frame), 1024, 0)
 	if err != nil {
-		t.Fatalf("readFrame: %v", err)
+		t.Fatalf("ReadFrame: %v", err)
 	}
 	if got.Type != msg.Type || got.From != msg.From || got.Timestamp != msg.Timestamp {
 		t.Fatalf("unexpected decoded message: got %+v want %+v", got, msg)
@@ -42,7 +42,7 @@ func TestFrameEncodeRejectsOversize(t *testing.T) {
 func TestFrameDecodeRejectsInvalidLength(t *testing.T) {
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.BigEndian, uint32(10))
-	_, err := readFrame(bytes.NewReader(buf.Bytes()), 4, time.Second)
+	_, err := ReadFrame(bytes.NewReader(buf.Bytes()), 4, time.Second)
 	if err == nil {
 		t.Fatalf("expected invalid length error")
 	}
